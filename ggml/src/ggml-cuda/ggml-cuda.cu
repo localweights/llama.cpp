@@ -2353,7 +2353,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear &&
+                             (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_Q8_1) &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
     // fusion is not universally faster on Pascal
@@ -2396,8 +2397,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
-        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-        && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+        && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_Q8_1)
+        && dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
@@ -3525,7 +3526,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         //rms norm only supports F32
         if (mul->src[0]->type != GGML_TYPE_F32 ||
             mul->src[1]->type != GGML_TYPE_F32 ||
-            mul->type != GGML_TYPE_F32) {
+            (mul->type != GGML_TYPE_F32 && mul->type != GGML_TYPE_Q8_1)) {
             return false;
         }
 
@@ -3990,7 +3991,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        ggml_tensor *       mul_node      = cgraph->nodes[i + 1];
+        const int32_t       mul_use_count = ggml_node_get_use_count(cgraph, i + 1);
+        int                 found         = 0;
+        bool                all_mul_mat   = true;
+        for (int j = i + 2; j < cgraph->n_nodes && found < mul_use_count; j++) {
+            ggml_tensor * cand     = cgraph->nodes[j];
+            const bool    uses_mul = cand->src[0] == mul_node || cand->src[1] == mul_node;
+            if (!uses_mul) { continue; }
+            found++;
+            if (cand->op != GGML_OP_MUL_MAT
+                    || !ggml_is_quantized(cand->src[0]->type)
+                    || cand->ne[1] > MMVQ_MAX_BATCH_SIZE) {
+                all_mul_mat = false;
+                break;
+            }
+        }
+        if (all_mul_mat && found == mul_use_count) {
+            ggml_cuda_op_rms_norm_mul_q8_1(*cuda_ctx, node, mul_node);
+        } else {
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, mul_node);
+        }
         return 1;
     }
 
