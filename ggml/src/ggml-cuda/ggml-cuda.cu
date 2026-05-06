@@ -2384,6 +2384,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Use Q8_1 view if RMS_NORM+MUL fusion pre-quantized this activation
+    const auto q8_1_it = ctx.q8_1_views.find(src1);
+    if (q8_1_it != ctx.q8_1_views.end()) {
+        src1 = &q8_1_it->second;
+    }
+
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -4000,8 +4006,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const bool    uses_mul = cand->src[0] == mul_node || cand->src[1] == mul_node;
             if (!uses_mul) { continue; }
             found++;
+            const ggml_tensor * w = cand->src[0];
+            // mirror ggml_cuda_mul_mat's use_mul_mat_vec_q conditions so we only
+            // activate Q8_1 fusion when MMVQ will actually be selected at runtime
+            const bool bad_pad = w->buffer &&
+                ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                ggml_nbytes(w) != ggml_backend_buffer_get_alloc_size(w->buffer, w) &&
+                w->view_src;
+            const bool split = (w->buffer && ggml_backend_buft_is_cuda_split(w->buffer->buft)) ||
+                (mul_node->buffer && ggml_backend_buft_is_cuda_split(mul_node->buffer->buft));
             if (cand->op != GGML_OP_MUL_MAT
-                    || !ggml_is_quantized(cand->src[0]->type)
+                    || !ggml_is_quantized(w->type)
+                    || bad_pad
+                    || split
                     || cand->ne[1] > MMVQ_MAX_BATCH_SIZE) {
                 all_mul_mat = false;
                 break;
@@ -4009,7 +4026,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         if (all_mul_mat && found == mul_use_count) {
             ggml_cuda_op_rms_norm_mul_q8_1(*cuda_ctx, node, mul_node);
+            // Build a Q8_1 view of mul_node->data so downstream mul_mat dispatch
+            // can use the pre-quantized buffer directly, without type-patching the
+            // original tensor or allocating a separate side buffer.
+            ggml_tensor view  = *mul_node;
+            view.type  = GGML_TYPE_Q8_1;
+            view.nb[0] = ggml_type_size(GGML_TYPE_Q8_1);
+            view.nb[1] = (mul_node->ne[0] / QK8_1) * sizeof(block_q8_1);
+            view.nb[2] = view.nb[1] * mul_node->ne[1];
+            view.nb[3] = view.nb[2] * mul_node->ne[2];
+            cuda_ctx->q8_1_views.insert_or_assign(mul_node, view);
         } else {
+            cuda_ctx->q8_1_views.erase(mul_node);
             ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, mul_node);
         }
         return 1;
@@ -4142,6 +4170,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             } else {
                 stream_ctx.concurrent_events.clear();
             }
+
+            // Q8_1 views are rebuilt from scratch on every fresh evaluation so
+            // they always reflect the current execution path (decode vs. prefill).
+            cuda_ctx->q8_1_views.clear();
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];

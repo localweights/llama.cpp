@@ -745,12 +745,6 @@ void ggml_cuda_op_rms_norm_mul_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor
             src_d, weight_d, dst_d, ne00, s01, s02, s03, eps);
     }
 
-    // Patch mul_node type and strides so downstream MUL_MAT sees Q8_1
-    mul_node->type  = GGML_TYPE_Q8_1;
-    mul_node->nb[0] = sizeof(block_q8_1);
-    mul_node->nb[1] = (ne00 / QK8_1) * sizeof(block_q8_1);
-    mul_node->nb[2] = mul_node->nb[1] * mul_node->ne[1];
-    mul_node->nb[3] = mul_node->nb[2] * mul_node->ne[2];
 }
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

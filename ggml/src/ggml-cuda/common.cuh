@@ -1424,6 +1424,12 @@ struct ggml_backend_cuda_context {
     }
 #endif // USE_CUDA_GRAPH
 
+    // Q8_1 view tensors for RMS_NORM+MUL fusion: maps original F32 mul_node to a Q8_1-typed
+    // view of the same buffer. Populated by try_fuse, consumed by ggml_cuda_mul_mat dispatch.
+    // Cleared before each fresh graph evaluation so it is always consistent with the current
+    // execution path (decode vs. prefill).
+    std::unordered_map<const ggml_tensor *, ggml_tensor> q8_1_views;
+
     explicit ggml_backend_cuda_context(int device) :
         device(device),
         name(GGML_CUDA_NAME + std::to_string(device)) {
