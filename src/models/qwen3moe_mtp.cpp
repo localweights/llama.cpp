@@ -41,7 +41,9 @@ void llama_model_qwen3moe_mtp::load_arch_tensors(llama_model_loader &) {
 
         // MTP block: full-attention qwen3moe decoder block with routed-expert MoE FFN.
         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), { n_embd }, 0);
-        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
+        // qwen3moe pattern: pre-FFN ffn_norm (NOT post-attention norm — that's
+        // qwen35moe style). Same semantic position; different tensor name in GGUF.
+        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
 
         // Plain GQA: Q is n_head * head_k, K and V are n_kv_head * head_*. No Q-gate
         // (qwen3moe base does NOT gate Q the way qwen35moe does).
@@ -154,8 +156,8 @@ llama_model_qwen3moe_mtp::graph::graph(const llama_model & model, const llm_grap
     cb(cur, "mtp_attn_residual", il);
 
     ggml_tensor * ffn_residual = cur;
-    cur = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
-    cb(cur, "mtp_attn_post_norm", il);
+    cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_ffn_norm", il);
 
     // Routed-only MoE FFN (qwen3moe has no shared expert).
     ggml_tensor * moe_out =

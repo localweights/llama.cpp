@@ -4,7 +4,15 @@ void llama_model_qwen3moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-    switch (hparams.n_layer) {
+
+    // Optional NextN/MTP tail layers — only present when this GGUF was built
+    // with an MTP head fused in (block_count counts trunk + MTP). The trunk
+    // loader skips MTP layers; the sibling qwen3moe_mtp loader (loaded with
+    // override_arch) creates them.
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+
+    const uint32_t n_main = hparams.n_layer - hparams.nextn_predict_layers;
+    switch (n_main) {
         case 48: type = LLM_TYPE_30B_A3B; break;
         case 94: type = LLM_TYPE_235B_A22B; break;
         default: type = LLM_TYPE_UNKNOWN;
@@ -52,6 +60,17 @@ void llama_model_qwen3moe::load_arch_tensors(llama_model_loader &) {
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+
+        // NextN/MTP tensors (preserved but unused on trunk path; owned by
+        // sibling qwen3moe_mtp loader). Only present on MTP tail layers.
+        if (hparams.nextn_predict_layers > 0 && static_cast<uint32_t>(i) >= n_layer - hparams.nextn_predict_layers) {
+            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), { 2 * n_embd, n_embd }, TENSOR_NOT_REQUIRED);
+            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), { n_embd },              TENSOR_NOT_REQUIRED);
+            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), { n_embd },              TENSOR_NOT_REQUIRED);
+            layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), { n_embd, n_vocab },     TENSOR_NOT_REQUIRED);
+            layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), { n_embd, n_vocab },     TENSOR_NOT_REQUIRED);
+            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), { n_embd },              TENSOR_NOT_REQUIRED);
+        }
     }
 }
 
@@ -77,7 +96,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    // Trunk forward only iterates non-MTP layers; MTP block (if any) lives in
+    // the sibling qwen3moe_mtp graph.
+    const int n_transformer_layers = (int)n_layer - (int)hparams.nextn_predict_layers;
+    for (int il = 0; il < n_transformer_layers; ++il) {
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -118,7 +140,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_transformer_layers - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
