@@ -969,18 +969,16 @@ private:
                 return false;
             }
 
-            if (params_base.n_parallel > 1) {
-                SRV_ERR("MTP currently supports only n_parallel=1; got %d\n", params_base.n_parallel);
-                return false;
-            }
-
+            // n_parallel > 1 is now supported: each slot gets its own ctx_mtp.
+            // The shared cparams template is stored here; seq_id is set per-slot at init time.
             auto cparams_mtp = common_context_params_to_llama(params_base);
             cparams_mtp.n_ctx     = llama_n_ctx_seq(ctx);
-            cparams_mtp.n_seq_max = 1;
-            cparams_mtp.n_rs_seq = 0;
+            cparams_mtp.n_seq_max = 1; // each ctx_mtp is a single-seq context
+            cparams_mtp.n_rs_seq  = 0;
 
             params_base.speculative.mtp.model   = model_mtp.get();
             params_base.speculative.mtp.cparams = cparams_mtp;
+            // seq_id will be set per-slot in slot initialisation below
 
             if (params_base.n_cache_reuse) {
                 params_base.n_cache_reuse = 0;
@@ -1093,6 +1091,10 @@ private:
             // try speculative decoding
             if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
                 slot.is_mtp_enabled = params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
+                if (slot.is_mtp_enabled) {
+                    // Each slot drives a unique trunk seq_id == slot.id.
+                    params_base.speculative.mtp.seq_id = (llama_seq_id) slot.id;
+                }
                 slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx));
 
                 if (slot.spec) {
@@ -1191,12 +1193,21 @@ private:
                     }
                 }
                 if (ok) {
-                    const int n_embd = llama_model_n_embd(model);
-                    llama_init_tap_layers(ctx,
-                                         params_base.tap_out_dir.c_str(),
-                                         tap_layer_vec.data(),
-                                         (int)tap_layer_vec.size(),
-                                         n_embd);
+                    const int n_embd    = llama_model_n_embd(model);
+                    const int n_seq_max = std::max(1, params_base.n_parallel);
+                    if (n_seq_max > 16) {
+                        SRV_ERR("--parallel %d exceeds tap-dump limit of 16\n", n_seq_max);
+                    } else {
+                        SRV_INF("tap-dump: n_seq_max=%d, merge_on_close=%s\n",
+                                n_seq_max, params_base.tap_merge_on_close ? "true" : "false");
+                        llama_init_tap_layers(ctx,
+                                             params_base.tap_out_dir.c_str(),
+                                             tap_layer_vec.data(),
+                                             (int)tap_layer_vec.size(),
+                                             n_embd,
+                                             n_seq_max,
+                                             params_base.tap_merge_on_close);
+                    }
                 }
             }
         }

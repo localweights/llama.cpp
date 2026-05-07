@@ -89,8 +89,12 @@ struct llama_context {
     ggml_tensor * get_t_h_pre_norm() const;
     ggml_tensor * get_t_mtp_out()    const;
 
-    void            set_mtp(llama_context * ctx_mtp_in);
-    llama_context * get_mtp() const { return mtp.ctx_mtp; }
+    void set_mtp(llama_seq_id seq_id, llama_context * ctx_mtp_in);
+    // Returns the ctx_mtp registered for seq_id, or nullptr if none.
+    llama_context * get_mtp(llama_seq_id seq_id) const {
+        auto it = mtp_map.find(seq_id);
+        return (it != mtp_map.end()) ? it->second.ctx_mtp : nullptr;
+    }
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -249,7 +253,8 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
     // tap-layer hidden-state dump — public so the C-API wrapper can call it
-    void init_tap_layers(const char * dir, const std::vector<int> & layers, int n_embd);
+    void init_tap_layers(const char * dir, const std::vector<int> & layers, int n_embd,
+                         int n_seq_max, bool merge_on_close);
 
 private:
     llm_graph_params graph_params(
@@ -264,6 +269,7 @@ private:
             int32_t                n_tokens,
             const llama_token    * tokens,
             const llama_pos      * positions,
+            const llama_seq_id   * seq_ids,    // seq_id for each token in the ubatch
             struct ggml_tensor   * t_h_pre_norm);
 
     // TODO: read/write lora adapters and cvec
@@ -286,7 +292,7 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
-    llama_mtp mtp;
+    llama_mtp_map mtp_map; // seq_id → per-slot MTP hook state (empty == MTP disabled)
 
     std::unique_ptr<llama_memory_i> memory;
 
@@ -387,11 +393,16 @@ private:
 
     // tap-layer hidden-state dump
     // Populated by init_tap_layers(); zero overhead when tap_out_dir == nullptr.
-    const char *             tap_out_dir = nullptr;
+    const char *             tap_out_dir        = nullptr;
     std::vector<int>         tap_layers;
-    std::vector<std::ofstream> tap_files; // one per tap_layers entry, same order
-    int                      tap_n_embd  = 0;
+    // tap_files[layer_idx][seq_idx] — one file per (layer, seq) pair.
+    // When n_seq_max == 1 the filename is h_l<L>.bin (backward compat).
+    // When n_seq_max > 1  the filenames are h_l<L>.s0.bin .. h_l<L>.s<N-1>.bin.
+    std::vector<std::vector<std::ofstream>> tap_files;
+    int                      tap_n_embd         = 0;
+    int                      tap_n_seq_max      = 0; // set by init_tap_layers
+    bool                     tap_merge_on_close = false; // concat s*.bin → h_l<L>.bin on destroy
 
     // Called from process_ubatch after graph_compute returns GGML_STATUS_SUCCESS.
-    void write_tap_layers_post_compute(ggml_cgraph * gf);
+    void write_tap_layers_post_compute(ggml_cgraph * gf, const llama_ubatch & ubatch);
 };

@@ -975,19 +975,29 @@ extern "C" {
     LLAMA_API struct ggml_tensor * llama_context_get_t_h_pre_norm(struct llama_context * ctx);
     LLAMA_API struct ggml_tensor * llama_context_get_t_mtp_out   (struct llama_context * ctx);
 
+    // Register or unregister a per-slot MTP draft context.
+    // seq_id identifies which trunk KV sequence this slot drives.
+    // Each ctx_mtp must have n_seq_max=1 (its own single-seq KV cache).
+    // Pass ctx_mtp=NULL to unregister the slot.
     LLAMA_API void llama_set_mtp(
             struct llama_context * ctx_target,
+            llama_seq_id           seq_id,
             struct llama_context * ctx_mtp);
 
     // [EXPERIMENTAL] Tap-layer dump: open per-layer f16 files in `dir` and write manifest.json.
     // Call once after model init. layers[n_layers] are 0-based layer indices; n_embd is model embedding dim.
+    // n_seq_max > 1: creates per-seq files h_l<L>.s<S>.bin (supports --parallel N capture).
+    // n_seq_max == 1: backward-compat single file h_l<L>.bin.
+    // merge_on_close: when n_seq_max > 1, concatenate s*.bin into h_l<L>.bin on context destroy.
     // When dir==NULL or n_layers==0 the function is a no-op (same as not calling it).
     LLAMA_API void llama_init_tap_layers(
             struct llama_context * ctx,
             const char           * dir,
             const int            * layers,
             int                    n_layers,
-            int                    n_embd);
+            int                    n_embd,
+            int                    n_seq_max,
+            bool                   merge_on_close);
 
     LLAMA_API bool llama_context_seq_rm(
             struct llama_context * ctx,

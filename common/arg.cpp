@@ -4100,6 +4100,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
 
+    add_opt(common_arg(
+        {"--tap-merge-on-close"},
+        "when --parallel N>1, concatenate per-seq h_l<L>.s*.bin files into h_l<L>.bin on server shutdown",
+        [](common_params & params) {
+            params.tap_merge_on_close = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+
     return ctx_arg;
 }
 

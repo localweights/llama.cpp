@@ -394,10 +394,74 @@ llama_context::~llama_context() {
             }
         }
     }
-    if (mtp.hook_batch.pos != nullptr) {
-        llama_batch_free(mtp.hook_batch);
+    for (auto & [sid, slot] : mtp_map) {
+        if (slot.hook_batch.pos != nullptr) {
+            llama_batch_free(slot.hook_batch);
+        }
     }
+    mtp_map.clear();
     ggml_opt_free(opt_ctx);
+
+    // tap-layer cleanup: flush, close, and optionally merge per-seq files
+    if (tap_out_dir != nullptr && tap_merge_on_close && tap_n_seq_max > 1) {
+        LLAMA_LOG_INFO("%s: tap merge-on-close: merging %d seq files per layer into h_l<L>.bin\n",
+                       __func__, tap_n_seq_max);
+        for (size_t li = 0; li < tap_layers.size(); ++li) {
+            // flush + close all seq files first
+            for (int s = 0; s < tap_n_seq_max; ++s) {
+                if (tap_files[li][s].is_open()) {
+                    tap_files[li][s].flush();
+                    tap_files[li][s].close();
+                }
+            }
+            // open merged output in append mode
+            std::string merged_path = std::string(tap_out_dir) + "/h_l"
+                                    + std::to_string(tap_layers[li]) + ".bin";
+            std::ofstream merged(merged_path, std::ios::binary | std::ios::app);
+            if (!merged.is_open()) {
+                LLAMA_LOG_ERROR("%s: failed to open merged file '%s'\n", __func__, merged_path.c_str());
+                continue;
+            }
+            for (int s = 0; s < tap_n_seq_max; ++s) {
+                std::string seq_path = std::string(tap_out_dir) + "/h_l"
+                                     + std::to_string(tap_layers[li])
+                                     + ".s" + std::to_string(s) + ".bin";
+                std::ifstream src(seq_path, std::ios::binary);
+                if (!src.is_open()) {
+                    LLAMA_LOG_WARN("%s: tap merge: could not open '%s'\n", __func__, seq_path.c_str());
+                    continue;
+                }
+                merged << src.rdbuf();
+            }
+        }
+        // update manifest to reflect merged state
+        {
+            std::string manifest_path = std::string(tap_out_dir) + "/manifest.json";
+            // Rewrite manifest with per_seq_files: false
+            std::ofstream mf(manifest_path);
+            if (mf.is_open()) {
+                const auto now    = std::chrono::system_clock::now();
+                const auto now_tt = std::chrono::system_clock::to_time_t(now);
+                char ts_buf[32];
+                std::strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%dT%H:%M:%S", std::gmtime(&now_tt));
+                mf << "{\n";
+                mf << "  \"tap_layers\": [";
+                for (size_t i = 0; i < tap_layers.size(); ++i) {
+                    if (i > 0) mf << ", ";
+                    mf << tap_layers[i];
+                }
+                mf << "],\n";
+                mf << "  \"n_embd\": " << tap_n_embd << ",\n";
+                mf << "  \"dtype\": \"f16\",\n";
+                mf << "  \"n_seq_max\": " << tap_n_seq_max << ",\n";
+                mf << "  \"per_seq_files\": false,\n";
+                mf << "  \"merge_on_close\": true,\n";
+                mf << "  \"model_path\": \"" << model.name << "\",\n";
+                mf << "  \"closed_at\": \"" << ts_buf << "Z\"\n";
+                mf << "}\n";
+            }
+        }
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -677,12 +741,17 @@ void llama_context::synchronize() {
     t_compute_start_us = 0;
 }
 
-void llama_context::init_tap_layers(const char * dir, const std::vector<int> & layers, int n_embd) {
+void llama_context::init_tap_layers(const char * dir, const std::vector<int> & layers, int n_embd,
+                                    int n_seq_max, bool merge_on_close) {
     if (!dir || layers.empty()) {
         return;
     }
     if (tap_out_dir != nullptr) {
         // already initialised — nothing to do
+        return;
+    }
+    if (n_seq_max < 1 || n_seq_max > 16) {
+        LLAMA_LOG_ERROR("%s: n_seq_max=%d out of range [1, 16]\n", __func__, n_seq_max);
         return;
     }
 
@@ -692,20 +761,33 @@ void llama_context::init_tap_layers(const char * dir, const std::vector<int> & l
         return;
     }
 
-    tap_out_dir = dir;
-    tap_layers  = layers;
-    tap_n_embd  = n_embd;
+    tap_out_dir        = dir;
+    tap_layers         = layers;
+    tap_n_embd         = n_embd;
+    tap_n_seq_max      = n_seq_max;
+    tap_merge_on_close = merge_on_close && (n_seq_max > 1);
 
-    // open one append-mode binary file per layer
+    // open append-mode binary files: tap_files[layer_idx][seq_idx]
+    // n_seq_max == 1 → single file "h_l<L>.bin"  (backward compat)
+    // n_seq_max  > 1 → per-seq  "h_l<L>.s<S>.bin"
     tap_files.resize(layers.size());
     for (size_t i = 0; i < layers.size(); ++i) {
-        std::string path = std::string(dir) + "/h_l" + std::to_string(layers[i]) + ".bin";
-        tap_files[i].open(path, std::ios::binary | std::ios::app);
-        if (!tap_files[i].is_open()) {
-            LLAMA_LOG_ERROR("%s: failed to open tap file '%s'\n", __func__, path.c_str());
-            tap_out_dir = nullptr;
-            tap_files.clear();
-            return;
+        tap_files[i].resize(n_seq_max);
+        for (int s = 0; s < n_seq_max; ++s) {
+            std::string path;
+            if (n_seq_max == 1) {
+                path = std::string(dir) + "/h_l" + std::to_string(layers[i]) + ".bin";
+            } else {
+                path = std::string(dir) + "/h_l" + std::to_string(layers[i])
+                     + ".s" + std::to_string(s) + ".bin";
+            }
+            tap_files[i][s].open(path, std::ios::binary | std::ios::app);
+            if (!tap_files[i][s].is_open()) {
+                LLAMA_LOG_ERROR("%s: failed to open tap file '%s'\n", __func__, path.c_str());
+                tap_out_dir = nullptr;
+                tap_files.clear();
+                return;
+            }
         }
     }
 
@@ -737,6 +819,9 @@ void llama_context::init_tap_layers(const char * dir, const std::vector<int> & l
         mf << "],\n";
         mf << "  \"n_embd\": " << n_embd << ",\n";
         mf << "  \"dtype\": \"f16\",\n";
+        mf << "  \"n_seq_max\": " << n_seq_max << ",\n";
+        mf << "  \"per_seq_files\": " << (n_seq_max > 1 ? "true" : "false") << ",\n";
+        mf << "  \"merge_on_close\": " << (tap_merge_on_close ? "true" : "false") << ",\n";
         mf << "  \"model_path\": \"" << model.name << "\",\n";
         mf << "  \"started_at\": \"" << ts_ms << "\"\n";
         mf << "}\n";
@@ -747,10 +832,11 @@ void llama_context::init_tap_layers(const char * dir, const std::vector<int> & l
         if (i > 0) LLAMA_LOG_INFO(",");
         LLAMA_LOG_INFO("%d", layers[i]);
     }
-    LLAMA_LOG_INFO("], n_embd=%d\n", n_embd);
+    LLAMA_LOG_INFO("], n_embd=%d, n_seq_max=%d, merge_on_close=%s\n",
+                   n_embd, n_seq_max, tap_merge_on_close ? "true" : "false");
 }
 
-void llama_context::write_tap_layers_post_compute(ggml_cgraph * gf) {
+void llama_context::write_tap_layers_post_compute(ggml_cgraph * gf, const llama_ubatch & ubatch) {
     if (!tap_out_dir || tap_layers.empty() || !gf) {
         return;
     }
@@ -758,6 +844,8 @@ void llama_context::write_tap_layers_post_compute(ggml_cgraph * gf) {
     // Ensure device computation is complete before reading tensor data.
     // (graph_compute is async; handle_mtp may or may not have synced already.)
     ggml_backend_sched_synchronize(sched.get());
+
+    const uint32_t n_tokens = ubatch.n_tokens;
 
     for (size_t idx = 0; idx < tap_layers.size(); ++idx) {
         int L = tap_layers[idx];
@@ -779,10 +867,11 @@ void llama_context::write_tap_layers_post_compute(ggml_cgraph * gf) {
             continue;
         }
 
-        const size_t nbytes_f32 = ggml_nbytes(t); // tensor is f32 on device
+        // Tensor shape: [n_embd, n_tokens] (f32 on device).
+        const size_t nbytes_f32 = ggml_nbytes(t);
         const size_t n_elem     = nbytes_f32 / sizeof(float);
 
-        // copy device → host (sync already happened in graph_compute path)
+        // copy device → host
         std::vector<uint8_t> host(nbytes_f32);
         ggml_backend_t bk = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         if (!bk) {
@@ -791,16 +880,40 @@ void llama_context::write_tap_layers_post_compute(ggml_cgraph * gf) {
         }
         ggml_backend_tensor_get(t, host.data(), 0, nbytes_f32);
 
-        // convert f32 → f16
+        // convert f32 → f16 (full tensor)
         const float * f32_ptr = reinterpret_cast<const float *>(host.data());
         std::vector<ggml_fp16_t> f16_buf(n_elem);
         for (size_t e = 0; e < n_elem; ++e) {
             f16_buf[e] = ggml_fp32_to_fp16(f32_ptr[e]);
         }
 
-        tap_files[idx].write(reinterpret_cast<const char *>(f16_buf.data()),
-                             f16_buf.size() * sizeof(ggml_fp16_t));
-        tap_files[idx].flush();
+        if (tap_n_seq_max == 1 || !ubatch.seq_id) {
+            // Fast path: single-seq or no seq routing info — write everything to seq 0.
+            tap_files[idx][0].write(reinterpret_cast<const char *>(f16_buf.data()),
+                                    f16_buf.size() * sizeof(ggml_fp16_t));
+            tap_files[idx][0].flush();
+        } else {
+            // Multi-seq path: route each token row to its seq's file.
+            // Tensor layout: row i corresponds to token i, stride = n_embd f16 values.
+            const size_t row_f16_bytes = (size_t)tap_n_embd * sizeof(ggml_fp16_t);
+            GGML_ASSERT(n_tokens * tap_n_embd == n_elem);
+
+            for (uint32_t tok = 0; tok < n_tokens; ++tok) {
+                // seq_id[tok] is a pointer to an array of n_seq_id[tok] seq ids.
+                // We use the first (primary) seq_id for routing.
+                const llama_seq_id sid = ubatch.seq_id[tok][0];
+                // Clamp to valid range; skip tokens belonging to sequences outside our window.
+                if (sid < 0 || sid >= tap_n_seq_max) {
+                    continue;
+                }
+                const ggml_fp16_t * row_ptr = f16_buf.data() + (size_t)tok * tap_n_embd;
+                tap_files[idx][sid].write(reinterpret_cast<const char *>(row_ptr), row_f16_bytes);
+            }
+            // Flush all open files for this layer once after processing the whole ubatch.
+            for (int s = 0; s < tap_n_seq_max; ++s) {
+                tap_files[idx][s].flush();
+            }
+        }
     }
 }
 
@@ -1376,16 +1489,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    if (mtp.ctx_mtp) {
+    if (!mtp_map.empty()) {
+        // Build a flat seq_id[i] array from the ubatch (each token's first seq_id)
+        std::vector<llama_seq_id> ubatch_seq_ids(ubatch.n_tokens);
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            ubatch_seq_ids[i] = ubatch.seq_id ? ubatch.seq_id[i][0] : 0;
+        }
         handle_mtp_for_ubatch(
                 (int32_t) ubatch.n_tokens,
                 ubatch.token,
                 ubatch.pos,
+                ubatch_seq_ids.data(),
                 res->t_h_pre_norm);
     }
 
     // tap-layer hidden-state dump (zero overhead when tap_out_dir == nullptr)
-    write_tap_layers_post_compute(res->get_gf());
+    write_tap_layers_post_compute(res->get_gf(), ubatch);
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -3505,49 +3624,132 @@ ggml_tensor * llama_context_get_t_mtp_out(struct llama_context * ctx) {
     return ctx ? ctx->get_t_mtp_out() : nullptr;
 }
 
-void llama_set_mtp(struct llama_context * ctx_target, struct llama_context * ctx_mtp) {
+void llama_set_mtp(struct llama_context * ctx_target, llama_seq_id seq_id, struct llama_context * ctx_mtp) {
     if (!ctx_target) return;
-    ctx_target->set_mtp(ctx_mtp);
+    ctx_target->set_mtp(seq_id, ctx_mtp);
 }
 
-void llama_init_tap_layers(struct llama_context * ctx, const char * dir, const int * layers, int n_layers, int n_embd) {
+void llama_init_tap_layers(struct llama_context * ctx, const char * dir, const int * layers,
+                           int n_layers, int n_embd, int n_seq_max, bool merge_on_close) {
     if (!ctx || !dir || !layers || n_layers <= 0) return;
     std::vector<int> v(layers, layers + n_layers);
-    ctx->init_tap_layers(dir, v, n_embd);
+    ctx->init_tap_layers(dir, v, n_embd, n_seq_max, merge_on_close);
 }
 
-void llama_context::set_mtp(llama_context * ctx_mtp_in) {
-    if (mtp.ctx_mtp == ctx_mtp_in) return;
+void llama_context::set_mtp(llama_seq_id seq_id, llama_context * ctx_mtp_in) {
+    auto it = mtp_map.find(seq_id);
 
-    if (mtp.hook_batch.pos != nullptr) {
-        llama_batch_free(mtp.hook_batch);
-        mtp.hook_batch = llama_batch{};
+    if (ctx_mtp_in == nullptr) {
+        // Unregister this seq_id
+        if (it != mtp_map.end()) {
+            if (it->second.hook_batch.pos != nullptr) {
+                llama_batch_free(it->second.hook_batch);
+            }
+            mtp_map.erase(it);
+            LLAMA_LOG_INFO("%s: MTP draft head unregistered for seq_id=%d\n", __func__, (int)seq_id);
+        }
+        return;
     }
 
-    mtp.ctx_mtp     = ctx_mtp_in;
-    mtp.pending_pos = -1;
-
-    if (mtp.ctx_mtp) {
-        const int32_t n_ub   = (int32_t) cparams.n_ubatch;
-        const int32_t n_embd = (int32_t) model.hparams.n_embd;
-        mtp.hook_batch       = llama_batch_init(n_ub, n_embd, 1);
-        mtp.hook_batch.token = (llama_token *) malloc(sizeof(llama_token) * n_ub);
-        mtp.pending_h.assign(n_embd, 0.0f);
-        LLAMA_LOG_INFO("%s: MTP draft head registered (ctx_mtp=%p, n_ubatch=%d, n_embd=%d)\n",
-                       __func__, (const void *) mtp.ctx_mtp, n_ub, n_embd);
-    } else {
-        mtp.pending_h.clear();
-        mtp.pending_h.shrink_to_fit();
-        LLAMA_LOG_INFO("%s: MTP draft head unregistered\n", __func__);
+    if (it != mtp_map.end() && it->second.ctx_mtp == ctx_mtp_in) {
+        return; // already registered with same ctx
     }
+
+    // Clean up any existing slot for this seq_id
+    if (it != mtp_map.end() && it->second.hook_batch.pos != nullptr) {
+        llama_batch_free(it->second.hook_batch);
+        it->second.hook_batch = llama_batch{};
+    }
+
+    llama_mtp_slot & slot = mtp_map[seq_id];
+    slot.ctx_mtp     = ctx_mtp_in;
+    slot.pending_pos = -1;
+
+    const int32_t n_ub   = (int32_t) cparams.n_ubatch;
+    const int32_t n_embd = (int32_t) model.hparams.n_embd;
+    slot.hook_batch       = llama_batch_init(n_ub, n_embd, 1);
+    slot.hook_batch.token = (llama_token *) malloc(sizeof(llama_token) * n_ub);
+    slot.pending_h.assign(n_embd, 0.0f);
+    LLAMA_LOG_INFO("%s: MTP draft head registered (seq_id=%d, ctx_mtp=%p, n_ubatch=%d, n_embd=%d)\n",
+                   __func__, (int)seq_id, (const void *) slot.ctx_mtp, n_ub, n_embd);
+}
+
+// Helper: process MTP hook for a single seq_id's tokens within the ubatch.
+// `rows` is the list of global row indices (into t) belonging to this seq.
+static void handle_mtp_for_seq(
+        llama_mtp_slot         & slot,
+        const llama_token      * tokens,
+        const llama_pos        * positions,
+        const std::vector<int> & rows,
+        const int64_t            n_embd,
+        struct ggml_tensor     * t) {
+    if (rows.empty()) return;
+
+    const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+    // Skip if the seq already has this range in the MTP KV (re-prefill guard).
+    const llama_pos pos_start = positions[rows[0]];
+    const llama_pos pos_max_mtp = llama_memory_seq_pos_max(llama_get_memory(slot.ctx_mtp), 0);
+    if (pos_start <= pos_max_mtp) {
+        return;
+    }
+
+    const bool pending_continues = slot.pending_pos >= 0 && slot.pending_pos + 1 == pos_start;
+    if (slot.pending_pos >= 0 && !pending_continues) {
+        slot.pending_pos = -1;
+    }
+
+    const int n_rows = (int) rows.size();
+    const int n_out  = (pending_continues ? 1 : 0) + (n_rows - 1);
+
+    if (n_out > 0) {
+        int out_idx = 0;
+        if (pending_continues) {
+            std::memcpy(slot.hook_batch.embd + (size_t) out_idx * n_embd,
+                        slot.pending_h.data(), row_bytes);
+            slot.hook_batch.token[out_idx]     = tokens[rows[0]];
+            slot.hook_batch.pos[out_idx]       = pos_start;
+            slot.hook_batch.n_seq_id[out_idx]  = 1;
+            slot.hook_batch.seq_id[out_idx][0] = 0; // ctx_mtp is n_seq_max=1, always seq 0
+            slot.hook_batch.logits[out_idx]    = 0;
+            ++out_idx;
+        }
+        for (int k = 0; k + 1 < n_rows; ++k) {
+            const int global_row = rows[k];
+            ggml_backend_tensor_get(t,
+                slot.hook_batch.embd + (size_t) out_idx * n_embd,
+                (size_t) global_row * row_bytes,
+                row_bytes);
+            slot.hook_batch.token[out_idx]     = tokens[rows[k + 1]];
+            slot.hook_batch.pos[out_idx]       = positions[rows[k + 1]];
+            slot.hook_batch.n_seq_id[out_idx]  = 1;
+            slot.hook_batch.seq_id[out_idx][0] = 0;
+            slot.hook_batch.logits[out_idx]    = 0;
+            ++out_idx;
+        }
+        GGML_ASSERT(out_idx == n_out);
+        slot.hook_batch.n_tokens = n_out;
+
+        const int32_t rc_dec = llama_decode(slot.ctx_mtp, slot.hook_batch);
+        if (rc_dec != 0) {
+            LLAMA_LOG_ERROR("%s: llama_decode(ctx_mtp) failed rc=%d (seq_id=?, pos=%d, n=%d)\n",
+                            __func__, (int) rc_dec, (int) pos_start, n_out);
+        }
+    }
+
+    // Stash the last h-row of this seq as pending for the next ubatch.
+    ggml_backend_tensor_get(t, slot.pending_h.data(),
+        (size_t) rows.back() * row_bytes, row_bytes);
+    slot.pending_pos = positions[rows.back()];
 }
 
 void llama_context::handle_mtp_for_ubatch(
         int32_t                n_tokens,
         const llama_token    * tokens,
         const llama_pos      * positions,
+        const llama_seq_id   * seq_ids,
         struct ggml_tensor   * t) {
-    if (n_tokens == 0 || t == nullptr) {
+    if (n_tokens == 0 || t == nullptr || mtp_map.empty()) {
         return;
     }
     if (t->ne[1] != (int64_t) n_tokens) {
@@ -3556,63 +3758,26 @@ void llama_context::handle_mtp_for_ubatch(
     const int64_t n_embd = model.hparams.n_embd;
     GGML_ASSERT(t->ne[0] == n_embd);
 
-    const int       n_rows    = (int) n_tokens;
-    const llama_pos pos_start = positions[0];
-
-    const llama_pos pos_max_mtp = llama_memory_seq_pos_max(llama_get_memory(mtp.ctx_mtp), 0);
-    if (pos_start <= pos_max_mtp) {
-        return;
+    // Group token row indices by seq_id so each slot's ctx_mtp sees only its own rows.
+    std::unordered_map<llama_seq_id, std::vector<int>> seq_rows;
+    for (int i = 0; i < n_tokens; ++i) {
+        const llama_seq_id sid = seq_ids ? seq_ids[i] : 0;
+        if (mtp_map.count(sid)) {
+            seq_rows[sid].push_back(i);
+        }
     }
 
-    const bool pending_continues = mtp.pending_pos >= 0 && mtp.pending_pos + 1 == pos_start;
-    if (mtp.pending_pos >= 0 && !pending_continues) {
-        mtp.pending_pos = -1;
+    if (seq_rows.empty()) {
+        return;
     }
 
     synchronize();
 
-    const size_t row_bytes = (size_t) n_embd * sizeof(float);
-    const int    n_out     = (pending_continues ? 1 : 0) + (n_rows - 1);
-
-    if (n_out > 0) {
-        int out_idx = 0;
-        if (pending_continues) {
-            std::memcpy(mtp.hook_batch.embd + (size_t) out_idx * n_embd,
-                        mtp.pending_h.data(), row_bytes);
-            mtp.hook_batch.token[out_idx]     = tokens[0];
-            mtp.hook_batch.pos[out_idx]       = pos_start;
-            mtp.hook_batch.n_seq_id[out_idx]  = 1;
-            mtp.hook_batch.seq_id[out_idx][0] = 0;
-            mtp.hook_batch.logits[out_idx]    = 0;
-            ++out_idx;
-        }
-        for (int k = 0; k + 1 < n_rows; ++k) {
-            ggml_backend_tensor_get(t,
-                mtp.hook_batch.embd + (size_t) out_idx * n_embd,
-                (size_t) k * row_bytes,
-                row_bytes);
-            mtp.hook_batch.token[out_idx]     = tokens[k + 1];
-            mtp.hook_batch.pos[out_idx]       = positions[k + 1];
-            mtp.hook_batch.n_seq_id[out_idx]  = 1;
-            mtp.hook_batch.seq_id[out_idx][0] = 0;
-            mtp.hook_batch.logits[out_idx]    = 0;
-            ++out_idx;
-        }
-        GGML_ASSERT(out_idx == n_out);
-        mtp.hook_batch.n_tokens = n_out;
-
-        const int32_t rc_dec = llama_decode(mtp.ctx_mtp, mtp.hook_batch);
-        if (rc_dec != 0) {
-            LLAMA_LOG_ERROR("%s: llama_decode(ctx_mtp) failed rc=%d (pos=%d, n=%d)\n",
-                            __func__, (int) rc_dec, (int) pos_start, n_out);
-        }
+    for (auto & [sid, rows] : seq_rows) {
+        auto it = mtp_map.find(sid);
+        if (it == mtp_map.end()) continue;
+        handle_mtp_for_seq(it->second, tokens, positions, rows, n_embd, t);
     }
-
-    // Stash the last h-row as the new pending (for the next ubatch's first
-    // token to pair with).
-    ggml_backend_tensor_get(t, mtp.pending_h.data(),
-        (size_t) (n_rows - 1) * row_bytes, row_bytes);
-    mtp.pending_pos = pos_start + n_rows - 1;
 }
 
 void llama_synchronize(llama_context * ctx) {

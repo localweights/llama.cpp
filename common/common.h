@@ -349,8 +349,9 @@ struct common_params_speculative_ngram_cache {
 };
 
 struct common_params_speculative_mtp {
-    llama_model        * model = nullptr;
+    llama_model        * model  = nullptr;
     llama_context_params cparams;
+    llama_seq_id         seq_id = 0; // trunk seq_id this slot drives (passed to llama_set_mtp)
 };
 
 struct common_params_speculative {
@@ -646,8 +647,9 @@ struct common_params {
     float slot_prompt_similarity = 0.1f;
 
     // tap-layer hidden-state dump (server only)
-    std::string tap_out_dir;      // directory to write h_l<L>.bin files; empty = disabled
-    std::string tap_layers_csv;   // comma-separated layer indices, e.g. "3,23,47"
+    std::string tap_out_dir;         // directory to write h_l<L>.bin files; empty = disabled
+    std::string tap_layers_csv;      // comma-separated layer indices, e.g. "3,23,47"
+    bool        tap_merge_on_close = false; // with --parallel N>1: concat s*.bin on shutdown
 
     // batched-bench params
     bool is_pp_shared   = false;
