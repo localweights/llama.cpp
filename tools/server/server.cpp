@@ -104,12 +104,6 @@ int main(int argc, char ** argv) {
         params.model_alias.insert(params.model.name);
     }
 
-    // tap-layer hidden-state dump
-    if (!params.tap_out_dir.empty()) {
-        params.tap_out_dir = params.tap_out_dir.c_str();
-        params.tap_layers_csv = params.tap_layers_csv.c_str();
-    }
-
     // struct that contains llama context and inference
     server_context ctx_server;
 

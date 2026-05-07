@@ -1,18 +1,15 @@
 
 #include "server-context.h"
+#include "server-chat.h"
+#include "server-common.h"
 #include "server-http.h"
-#include "server-models.h"
-#include "server-cors-proxy.h"
-#include "server-tools.h"
+#include "server-task.h"
+#include "server-queue.h"
 
-#include "arg.h"
 #include "build-info.h"
 #include "common.h"
-#include "fit.h"
 #include "llama.h"
 #include "log.h"
-
-#include <fstream>
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
@@ -1065,40 +1062,6 @@ private:
         }
 
         slots.clear();
-
-        // Initialize tap layers if requested
-        if (!params_base.tap_out_dir.empty() && !params_base.tap_layers_csv.empty()) {
-            // Parse tap layers from CSV
-            std::vector<int32_t> tap_layers;
-            std::string layers_str = params_base.tap_layers_csv;
-            size_t start = 0;
-            size_t end = layers_str.find(',');
-            while (end != std::string::npos) {
-                std::string layer_str = layers_str.substr(start, end - start);
-                try {
-                    int layer = std::stoi(layer_str);
-                    tap_layers.push_back(layer);
-                } catch (const std::exception&) {
-                    // Skip invalid layers
-                }
-                start = end + 1;
-                end = layers_str.find(',', start);
-            }
-            // Handle last layer
-            std::string layer_str = layers_str.substr(start);
-            if (!layer_str.empty()) {
-                try {
-                    int layer = std::stoi(layer_str);
-                    tap_layers.push_back(layer);
-                } catch (const std::exception&) {
-                    // Skip invalid layer
-                }
-            }
-            if (!tap_layers.empty()) {
-                std::string model_hash = llama_model_hash_string(model);
-                init_tap_layers(params_base.tap_out_dir, tap_layers, llama_model_n_layer(model), model_hash);
-            }
-        }
 
         const auto ctx_seq_rm_type = common_context_can_seq_rm(ctx);
         if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
