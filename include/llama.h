@@ -979,10 +979,19 @@ extern "C" {
     // in t_h_pre_norm / logits.  Returns -1 if the token was not an output token.
     LLAMA_API int32_t llama_context_get_output_row(struct llama_context * ctx, int32_t batch_token_idx);
 
-    // Register or unregister a per-slot MTP draft context.
-    // seq_id identifies which trunk KV sequence this slot drives.
-    // Each ctx_mtp must have n_seq_max=1 (its own single-seq KV cache).
-    // Pass ctx_mtp=NULL to unregister the slot.
+    // Register or unregister a per-slot MTP (Multi-Token Prediction) draft context.
+    //
+    // seq_id: trunk KV sequence this slot drives (0-based, unique per slot).
+    //         When n_parallel=1 use seq_id=0. For n_parallel=N use seq_id in [0,N).
+    //         The trunk's handle_mtp_for_ubatch hook uses this to route hidden states
+    //         from the right ubatch rows to the correct ctx_mtp.
+    //
+    // ctx_mtp: a separate llama_context created from the *_mtp arch variant of the
+    //          trunk model (e.g. qwen3moe_mtp), with n_seq_max=1. The MTP context
+    //          owns its own single-seq KV cache independent of the trunk.
+    //          Pass NULL to unregister; this frees the hook_batch resources for seq_id.
+    //
+    // Thread safety: must be called from the same thread that calls llama_decode on ctx_target.
     LLAMA_API void llama_set_mtp(
             struct llama_context * ctx_target,
             llama_seq_id           seq_id,
