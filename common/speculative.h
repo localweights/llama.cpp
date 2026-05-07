@@ -44,6 +44,11 @@ int32_t common_speculative_n_min(const common_speculative * spec, const common_p
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 
+// clear internal KV-cache state of all speculative impls (e.g. ctx_mtp).
+// must be called on slot eviction / prompt_clear to prevent stale-KV bugs
+// on the next request assigned to the same slot.
+void common_speculative_reset_kv(common_speculative * spec);
+
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
 };

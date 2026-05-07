@@ -159,6 +159,10 @@ struct common_speculative_state {
 
     virtual int32_t n_max(const common_params_speculative & params) const = 0;
     virtual int32_t n_min(const common_params_speculative & params) const = 0;
+
+    // Clear any internal KV-cache state (e.g. ctx_mtp KV) so that a fresh
+    // generation can start from position 0.  Called on slot eviction/reset.
+    virtual void reset_kv() {}
 };
 
 struct common_speculative_checkpoint {
@@ -861,6 +865,20 @@ struct common_speculative_state_mtp : public common_speculative_state {
     int32_t n_min(const common_params_speculative & params) const override {
         return std::max(1, params.draft.n_min);
     }
+
+    void reset_kv() override {
+        // Clear the entire MTP KV so the next request starts from position 0.
+        // Called on slot eviction / prompt_clear to prevent the re-prefill guard
+        // in handle_mtp_for_seq from silently skipping the new request's prefill.
+        if (ctx_mtp) {
+            llama_memory_seq_rm(llama_get_memory(ctx_mtp), /*seq_id=*/ 0, /*p0=*/ 0, /*p1=*/ -1);
+            LOG_DBG("%s: cleared ctx_mtp KV (seq_id=%d)\n", __func__, (int)seq_id);
+        }
+        last_n_drafted    = 0;
+        last_n_accepted   = -1;
+        last_accepted_row = -1;
+        last_h_valid      = false;
+    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
@@ -1503,6 +1521,16 @@ int32_t common_speculative_n_min(const common_speculative * spec, const common_p
     }
 
     return n_min;
+}
+
+void common_speculative_reset_kv(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->reset_kv();
+    }
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

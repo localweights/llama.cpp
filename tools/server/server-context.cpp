@@ -173,6 +173,12 @@ struct server_slot {
 
         llama_context_seq_rm(ctx, id, -1, -1);
         prompt.tokens.clear();
+
+        // Clear the MTP context's KV so the next request's prefill hook
+        // starts from position 0 and isn't skipped by the re-prefill guard.
+        if (spec) {
+            common_speculative_reset_kv(spec.get());
+        }
     }
 
     std::vector<common_adapter_lora_info> lora;
