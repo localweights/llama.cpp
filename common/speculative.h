@@ -20,8 +20,10 @@ common_speculative * common_speculative_init(
 
 void common_speculative_free(common_speculative * spec);
 
-// optionally call once at the beginning of a new generation
-void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
+// optionally call once at the beginning of a new generation.
+// last_row: row index in the trunk's last t_h_pre_norm tensor for this slot's last prefill token.
+// Pass -1 (default) for single-slot case (uses last row automatically).
+void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt, int32_t last_row = -1);
 
 // sample up to n_draft tokens and add them to the batch using the draft model
 llama_tokens common_speculative_draft(
@@ -30,8 +32,11 @@ llama_tokens common_speculative_draft(
                      const llama_tokens & prompt,
                             llama_token   id_last);
 
-// informs the speculative decoder that n_accepted tokens were accepted by the target model
-void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
+// informs the speculative decoder that n_accepted tokens were accepted by the target model.
+// last_accepted_row: the row index within the trunk's last t_h_pre_norm tensor that corresponds
+// to the last accepted token (used by MTP to correctly index the hidden state for the next draft).
+// For n_accepted==0, pass the row of the original (non-draft) token; defaults to -1 (auto = last row).
+void common_speculative_accept(common_speculative * spec, uint16_t n_accepted, int32_t last_accepted_row = -1);
 
 int32_t common_speculative_n_max(const common_speculative * spec, const common_params_speculative & params);
 int32_t common_speculative_n_min(const common_speculative * spec, const common_params_speculative & params);

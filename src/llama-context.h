@@ -89,6 +89,22 @@ struct llama_context {
     ggml_tensor * get_t_h_pre_norm() const;
     ggml_tensor * get_t_mtp_out()    const;
 
+    // Translate batch token index to output row index in t_h_pre_norm/logits.
+    // Returns -1 if the token was not configured to output.
+    int32_t get_output_row(int32_t batch_token_idx) const {
+        try {
+            return (int32_t) output_resolve_row(batch_token_idx);
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("get_output_row(%d): %s (n_outputs=%d, output_ids.size=%zu)\n",
+                    batch_token_idx, e.what(), n_outputs, output_ids.size());
+            return -1;
+        } catch (...) {
+            LLAMA_LOG_ERROR("get_output_row(%d): unknown exception (n_outputs=%d, output_ids.size=%zu)\n",
+                    batch_token_idx, n_outputs, output_ids.size());
+            return -1;
+        }
+    }
+
     void set_mtp(llama_seq_id seq_id, llama_context * ctx_mtp_in);
     // Returns the ctx_mtp registered for seq_id, or nullptr if none.
     llama_context * get_mtp(llama_seq_id seq_id) const {

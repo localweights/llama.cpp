@@ -3624,6 +3624,10 @@ ggml_tensor * llama_context_get_t_mtp_out(struct llama_context * ctx) {
     return ctx ? ctx->get_t_mtp_out() : nullptr;
 }
 
+int32_t llama_context_get_output_row(struct llama_context * ctx, int32_t batch_token_idx) {
+    return ctx ? ctx->get_output_row(batch_token_idx) : -1;
+}
+
 void llama_set_mtp(struct llama_context * ctx_target, llama_seq_id seq_id, struct llama_context * ctx_mtp) {
     if (!ctx_target) return;
     ctx_target->set_mtp(seq_id, ctx_mtp);
@@ -3752,6 +3756,11 @@ void llama_context::handle_mtp_for_ubatch(
     if (n_tokens == 0 || t == nullptr || mtp_map.empty()) {
         return;
     }
+    // t has n_outputs rows (one per token with logits=true).
+    // We only fire the hook when n_outputs == n_tokens, i.e., all tokens in the
+    // ubatch have an output row.  This is true for decode steps and speculative
+    // verification batches (all draft+1 tokens have logits=true), but NOT for
+    // prefill batches (only the last token has logits=true).
     if (t->ne[1] != (int64_t) n_tokens) {
         return;
     }
@@ -3947,7 +3956,8 @@ bool llama_context_seq_rm(
     }
     const bool ok = llama_memory_seq_rm(llama_get_memory(ctx), seq_id, p0, p1);
 
-    if (llama_context * ctx_mtp = ctx->get_mtp()) {
+    // Propagate seq_rm to the MTP slot for this seq_id (if registered).
+    if (llama_context * ctx_mtp = ctx->get_mtp(seq_id)) {
         llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, p0, p1);
     }
     return ok;

@@ -975,6 +975,10 @@ extern "C" {
     LLAMA_API struct ggml_tensor * llama_context_get_t_h_pre_norm(struct llama_context * ctx);
     LLAMA_API struct ggml_tensor * llama_context_get_t_mtp_out   (struct llama_context * ctx);
 
+    // Translate a batch token index (as returned by slot.i_batch) to an output row
+    // in t_h_pre_norm / logits.  Returns -1 if the token was not an output token.
+    LLAMA_API int32_t llama_context_get_output_row(struct llama_context * ctx, int32_t batch_token_idx);
+
     // Register or unregister a per-slot MTP draft context.
     // seq_id identifies which trunk KV sequence this slot drives.
     // Each ctx_mtp must have n_seq_max=1 (its own single-seq KV cache).

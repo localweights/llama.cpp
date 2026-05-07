@@ -3172,7 +3172,12 @@ private:
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
-                        common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens());
+                        // Translate the absolute batch token index to an output row in
+                        // t_h_pre_norm (which has n_outputs rows, not n_tokens rows).
+                        // Required for MTP to correctly index the hidden state when multiple
+                        // slots share the same trunk ubatch.
+                        const int32_t prefill_last_row = llama_context_get_output_row(slot.ctx, slot.i_batch);
+                        common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens(), prefill_last_row);
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
@@ -3246,6 +3251,10 @@ private:
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                     auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    // Translate the last-accepted batch token index to an output row in
+                    // t_h_pre_norm so MTP can index the correct hidden state for drafting.
+                    const int32_t last_acc_row = llama_context_get_output_row(
+                        slot.ctx, slot.spec_i_batch[accepted.size() - 1]);
                     slot.spec_i_batch.clear();
 
                     GGML_ASSERT(accepted.size() >= 1);
@@ -3287,7 +3296,7 @@ private:
                         SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                     }
 
-                    common_speculative_accept(slot.spec.get(), accepted.size() - 1);
+                    common_speculative_accept(slot.spec.get(), accepted.size() - 1, last_acc_row);
 
                     slot.spec_draft = std::move(accepted);
                 }
