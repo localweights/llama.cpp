@@ -699,6 +699,10 @@ struct common_params {
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
+
+    // tap-layer hidden-state dump
+    std::string tap_out_dir;
+    std::string tap_layers_csv;
 };
 
 // call once at the start of a program if it uses libcommon

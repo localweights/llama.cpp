@@ -277,6 +277,12 @@ private:
 
     llama_cparams cparams;
 
+    // tap-layer hidden-state dump
+    const char * tap_out_dir = nullptr;
+    std::vector<int> tap_layers;
+    std::vector<std::ofstream> tap_files;
+    int tap_n_embd = 0;
+
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 

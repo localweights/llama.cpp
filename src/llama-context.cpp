@@ -11,6 +11,9 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <chrono>
+#include <fstream>
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1498,6 +1501,65 @@ static void copy_tensor_async_floats(
         // Update the actual number of logits/probabilities that were written for this row.
         counts[row] = ggml_nelements(tensor);
     }
+
+    // tap-layer hidden-state dump
+    if (tap_out_dir && !tap_layers.empty()) {
+        // create output directory
+        const int ret = mkdir(tap_out_dir, 0755);
+        if (ret != 0 && errno != EEXIST) {
+            LLAMA_LOG_ERROR("%s: failed to create directory %s: %s\n", __func__, tap_out_dir, strerror(errno));
+            return;
+        }
+
+        // open files for each layer
+        const std::string base_path = std::string(tap_out_dir) + "/h_l";
+        for (int L : tap_layers) {
+            std::string path = base_path + std::to_string(L) + ".bin";
+            std::ofstream file(path, std::ios::binary | std::ios::app);
+            if (!file.is_open()) {
+                LLAMA_LOG_ERROR("%s: failed to open file %s\n", __func__, path.c_str());
+                return;
+            }
+            tap_files.push_back(std::move(file));
+        }
+
+        // write manifest file
+        std::string manifest_path = std::string(tap_out_dir) + "/manifest.json";
+        std::ofstream manifest(manifest_path);
+        if (!manifest.is_open()) {
+            LLAMA_LOG_ERROR("%s: failed to open manifest file %s\n", __func__, manifest_path.c_str());
+            return;
+        }
+
+        std::string model_path = model.path;
+        if (model_path.empty()) {
+            model_path = "unknown";
+        }
+
+        std::string iso_timestamp = "";
+        {
+            const auto now = std::chrono::system_clock::now();
+            const auto time_t = std::chrono::system_clock::to_time_t(now);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+            char buffer[100];
+            strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", std::localtime(&time_t));
+            iso_timestamp = std::string(buffer) + "." + std::to_string(ms.count()) + "Z";
+        }
+
+        manifest << "{\n";
+        manifest << "  \"tap_layers\": [";
+        for (size_t i = 0; i < tap_layers.size(); ++i) {
+            if (i > 0) manifest << ", ";
+            manifest << tap_layers[i];
+        }
+        manifest << "],\n";
+        manifest << "  \"n_embd\": " << tap_n_embd << ",\n";
+        manifest << "  \"dtype\": \"f16\",\n";
+        manifest << "  \"model_path\": \"" << model_path << "\",\n";
+        manifest << "  \"started_at\": \"" << iso_timestamp << "\"\n";
+        manifest << "}\n";
+        manifest.close();
+    }
 }
 
 static void copy_tensor_async_candidates(
@@ -1694,12 +1756,53 @@ int llama_context::decode(const llama_batch & batch_inp) {
         {
             int32_t n_outputs_new = 0;
 
-            if (n_outputs_all == n_tokens_all) {
-                n_outputs_new = ubatch.n_tokens;
-            } else {
-                for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-                    n_outputs_new += (int32_t) (ubatch.output[i] != 0);
+   if (n_outputs_all == n_tokens_all) {
+        n_outputs_new = ubatch.n_tokens;
+    } else {
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (ubatch.output[i]) {
+                n_outputs_new++;
+            }
+        }
+    }
+
+    // tap-layer hidden-state dump
+    if (tap_out_dir && !tap_layers.empty()) {
+        // iterate through the computed graph to find l_out tensors and dump them
+        for (int L : tap_layers) {
+            char tname[64];
+            snprintf(tname, sizeof tname, "l_out-%d", L);
+            ggml_tensor * t = nullptr;
+            for (int i = 0; i < ggml_graph_n_nodes(gf_res_prev->get_gf()); i++) {
+                ggml_tensor * n = ggml_graph_node(gf_res_prev->get_gf(), i);
+                if (n && strcmp(n->name, tname) == 0) {
+                    t = n;
+                    break;
                 }
+            }
+
+            if (t) {
+                // get the tensor data
+                size_t nbytes = ggml_nbytes(t);  // f32 raw
+                std::vector<uint8_t> host(nbytes);
+                ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                ggml_backend_tensor_get_async(backend, t, host.data(), 0, nbytes);
+                ggml_backend_synchronize(backend);
+
+                // convert f32 -> f16 in-place to halve disk
+                const float * f = (const float*)host.data();
+                size_t n_elem = nbytes / sizeof(float);
+                std::vector<ggml_fp16_t> half(n_elem);
+                for (size_t i = 0; i < n_elem; i++) {
+                    half[i] = ggml_fp32_to_fp16(f[i]);
+                }
+
+                // write to file
+                tap_files[L].write((const char*)half.data(), half.size() * sizeof(ggml_fp16_t));
+                tap_files[L].flush();
+            }
+        }
+    }
             }
 
             // needs to happen before the graph is built
@@ -1823,8 +1926,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case LLAMA_POOLING_TYPE_UNSPECIFIED:
                     {
                         GGML_ABORT("unknown pooling type");
-                    }
-            }
+   }
+
+    // tap-layer hidden-state dump
+    if (params.tap_out_dir) {
+        tap_out_dir = params.tap_out_dir;
+        tap_layers = params.tap_layers;
+        tap_n_embd = model.hparams.n_embd;
+    }
+}
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
