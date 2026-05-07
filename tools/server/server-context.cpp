@@ -21,6 +21,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <sstream>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -1163,6 +1164,42 @@ private:
 
         // propagate new defaults back to caller
         params = params_base;
+
+        // tap-layer hidden-state dump setup
+        if (!params_base.tap_out_dir.empty() && !params_base.tap_layers_csv.empty()) {
+            // parse CSV of layer indices
+            std::vector<int> tap_layer_vec;
+            {
+                std::istringstream ss(params_base.tap_layers_csv);
+                std::string tok;
+                while (std::getline(ss, tok, ',')) {
+                    try {
+                        int L = std::stoi(tok);
+                        tap_layer_vec.push_back(L);
+                    } catch (...) {
+                        SRV_WRN("--tap-layers: ignoring invalid token '%s'\n", tok.c_str());
+                    }
+                }
+            }
+            if (!tap_layer_vec.empty()) {
+                const int n_layer = llama_model_n_layer(model);
+                bool ok = true;
+                for (int L : tap_layer_vec) {
+                    if (L < 0 || L >= n_layer) {
+                        SRV_ERR("--tap-layers: layer %d out of range [0, %d)\n", L, n_layer);
+                        ok = false;
+                    }
+                }
+                if (ok) {
+                    const int n_embd = llama_model_n_embd(model);
+                    llama_init_tap_layers(ctx,
+                                         params_base.tap_out_dir.c_str(),
+                                         tap_layer_vec.data(),
+                                         (int)tap_layer_vec.size(),
+                                         n_embd);
+                }
+            }
+        }
 
         if (!is_resume) {
             return init();

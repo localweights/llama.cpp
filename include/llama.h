@@ -979,6 +979,16 @@ extern "C" {
             struct llama_context * ctx_target,
             struct llama_context * ctx_mtp);
 
+    // [EXPERIMENTAL] Tap-layer dump: open per-layer f16 files in `dir` and write manifest.json.
+    // Call once after model init. layers[n_layers] are 0-based layer indices; n_embd is model embedding dim.
+    // When dir==NULL or n_layers==0 the function is a no-op (same as not calling it).
+    LLAMA_API void llama_init_tap_layers(
+            struct llama_context * ctx,
+            const char           * dir,
+            const int            * layers,
+            int                    n_layers,
+            int                    n_embd);
+
     LLAMA_API bool llama_context_seq_rm(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,

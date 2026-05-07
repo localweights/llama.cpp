@@ -11,6 +11,7 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <fstream>
 #include <map>
 #include <vector>
 
@@ -247,6 +248,9 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // tap-layer hidden-state dump — public so the C-API wrapper can call it
+    void init_tap_layers(const char * dir, const std::vector<int> & layers, int n_embd);
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -380,4 +384,14 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // tap-layer hidden-state dump
+    // Populated by init_tap_layers(); zero overhead when tap_out_dir == nullptr.
+    const char *             tap_out_dir = nullptr;
+    std::vector<int>         tap_layers;
+    std::vector<std::ofstream> tap_files; // one per tap_layers entry, same order
+    int                      tap_n_embd  = 0;
+
+    // Called from process_ubatch after graph_compute returns GGML_STATUS_SUCCESS.
+    void write_tap_layers_post_compute(ggml_cgraph * gf);
 };

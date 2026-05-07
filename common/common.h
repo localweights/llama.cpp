@@ -649,6 +649,10 @@ struct common_params {
 
     float slot_prompt_similarity = 0.1f;
 
+    // tap-layer hidden-state dump (server only)
+    std::string tap_out_dir;      // directory to write h_l<L>.bin files; empty = disabled
+    std::string tap_layers_csv;   // comma-separated layer indices, e.g. "3,23,47"
+
     // batched-bench params
     bool is_pp_shared   = false;
     bool is_tg_separate = false;

@@ -4084,6 +4084,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
+    add_opt(common_arg(
+        {"--tap-out-dir"}, "DIR",
+        "directory to dump per-layer f16 hidden states (one h_l<L>.bin + manifest.json); empty disables",
+        [](common_params & params, const std::string & value) {
+            params.tap_out_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+
+    add_opt(common_arg(
+        {"--tap-layers"}, "L1,L2,...",
+        "comma-separated layer indices to capture with --tap-out-dir (e.g. 3,23,47)",
+        [](common_params & params, const std::string & value) {
+            params.tap_layers_csv = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+
     return ctx_arg;
 }
 

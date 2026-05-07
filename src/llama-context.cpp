@@ -11,6 +11,10 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <chrono>
+#include <fstream>
+#include <sys/stat.h>
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -673,6 +677,133 @@ void llama_context::synchronize() {
     t_compute_start_us = 0;
 }
 
+void llama_context::init_tap_layers(const char * dir, const std::vector<int> & layers, int n_embd) {
+    if (!dir || layers.empty()) {
+        return;
+    }
+    if (tap_out_dir != nullptr) {
+        // already initialised — nothing to do
+        return;
+    }
+
+    // create output directory (ignore EEXIST)
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+        LLAMA_LOG_ERROR("%s: failed to create tap dir '%s': %s\n", __func__, dir, strerror(errno));
+        return;
+    }
+
+    tap_out_dir = dir;
+    tap_layers  = layers;
+    tap_n_embd  = n_embd;
+
+    // open one append-mode binary file per layer
+    tap_files.resize(layers.size());
+    for (size_t i = 0; i < layers.size(); ++i) {
+        std::string path = std::string(dir) + "/h_l" + std::to_string(layers[i]) + ".bin";
+        tap_files[i].open(path, std::ios::binary | std::ios::app);
+        if (!tap_files[i].is_open()) {
+            LLAMA_LOG_ERROR("%s: failed to open tap file '%s'\n", __func__, path.c_str());
+            tap_out_dir = nullptr;
+            tap_files.clear();
+            return;
+        }
+    }
+
+    // write manifest.json
+    {
+        std::string manifest_path = std::string(dir) + "/manifest.json";
+        std::ofstream mf(manifest_path);
+        if (!mf.is_open()) {
+            LLAMA_LOG_ERROR("%s: failed to open manifest '%s'\n", __func__, manifest_path.c_str());
+            return;
+        }
+
+        // ISO-8601 timestamp
+        const auto now    = std::chrono::system_clock::now();
+        const auto now_tt = std::chrono::system_clock::to_time_t(now);
+        const auto ms     = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                now.time_since_epoch()) % 1000;
+        char ts_buf[32];
+        std::strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%dT%H:%M:%S", std::gmtime(&now_tt));
+        char ts_ms[40];
+        std::snprintf(ts_ms, sizeof(ts_ms), "%s.%03dZ", ts_buf, (int)ms.count());
+
+        mf << "{\n";
+        mf << "  \"tap_layers\": [";
+        for (size_t i = 0; i < layers.size(); ++i) {
+            if (i > 0) mf << ", ";
+            mf << layers[i];
+        }
+        mf << "],\n";
+        mf << "  \"n_embd\": " << n_embd << ",\n";
+        mf << "  \"dtype\": \"f16\",\n";
+        mf << "  \"model_path\": \"" << model.name << "\",\n";
+        mf << "  \"started_at\": \"" << ts_ms << "\"\n";
+        mf << "}\n";
+    }
+
+    LLAMA_LOG_INFO("%s: tap-layer dump enabled — dir='%s', layers=[", __func__, dir);
+    for (size_t i = 0; i < layers.size(); ++i) {
+        if (i > 0) LLAMA_LOG_INFO(",");
+        LLAMA_LOG_INFO("%d", layers[i]);
+    }
+    LLAMA_LOG_INFO("], n_embd=%d\n", n_embd);
+}
+
+void llama_context::write_tap_layers_post_compute(ggml_cgraph * gf) {
+    if (!tap_out_dir || tap_layers.empty() || !gf) {
+        return;
+    }
+
+    // Ensure device computation is complete before reading tensor data.
+    // (graph_compute is async; handle_mtp may or may not have synced already.)
+    ggml_backend_sched_synchronize(sched.get());
+
+    for (size_t idx = 0; idx < tap_layers.size(); ++idx) {
+        int L = tap_layers[idx];
+        char tname[64];
+        std::snprintf(tname, sizeof(tname), "l_out-%d", L);
+
+        ggml_tensor * t = nullptr;
+        const int n_nodes = ggml_graph_n_nodes(gf);
+        for (int i = 0; i < n_nodes; ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node && std::strcmp(node->name, tname) == 0) {
+                t = node;
+                break;
+            }
+        }
+
+        if (!t) {
+            // tensor absent from this graph (e.g. MTP graph) — skip silently
+            continue;
+        }
+
+        const size_t nbytes_f32 = ggml_nbytes(t); // tensor is f32 on device
+        const size_t n_elem     = nbytes_f32 / sizeof(float);
+
+        // copy device → host (sync already happened in graph_compute path)
+        std::vector<uint8_t> host(nbytes_f32);
+        ggml_backend_t bk = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        if (!bk) {
+            LLAMA_LOG_WARN("%s: no backend for tensor '%s', skipping\n", __func__, tname);
+            continue;
+        }
+        ggml_backend_tensor_get(t, host.data(), 0, nbytes_f32);
+
+        // convert f32 → f16
+        const float * f32_ptr = reinterpret_cast<const float *>(host.data());
+        std::vector<ggml_fp16_t> f16_buf(n_elem);
+        for (size_t e = 0; e < n_elem; ++e) {
+            f16_buf[e] = ggml_fp32_to_fp16(f32_ptr[e]);
+        }
+
+        tap_files[idx].write(reinterpret_cast<const char *>(f16_buf.data()),
+                             f16_buf.size() * sizeof(ggml_fp16_t));
+        tap_files[idx].flush();
+    }
+}
+
 const llama_model & llama_context::get_model() const {
     return model;
 }
@@ -1252,6 +1383,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 ubatch.pos,
                 res->t_h_pre_norm);
     }
+
+    // tap-layer hidden-state dump (zero overhead when tap_out_dir == nullptr)
+    write_tap_layers_post_compute(res->get_gf());
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -3374,6 +3508,12 @@ ggml_tensor * llama_context_get_t_mtp_out(struct llama_context * ctx) {
 void llama_set_mtp(struct llama_context * ctx_target, struct llama_context * ctx_mtp) {
     if (!ctx_target) return;
     ctx_target->set_mtp(ctx_mtp);
+}
+
+void llama_init_tap_layers(struct llama_context * ctx, const char * dir, const int * layers, int n_layers, int n_embd) {
+    if (!ctx || !dir || !layers || n_layers <= 0) return;
+    std::vector<int> v(layers, layers + n_layers);
+    ctx->init_tap_layers(dir, v, n_embd);
 }
 
 void llama_context::set_mtp(llama_context * ctx_mtp_in) {
