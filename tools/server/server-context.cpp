@@ -2981,7 +2981,7 @@ private:
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
                             { slot.id },
-                            need_embd);
+                            need_embd || tap_h_pre_norm_file.is_open());
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
