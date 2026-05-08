@@ -182,13 +182,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     }
     cur = inpL;
 
-    // Expose pre-norm hidden state for MTP head (NextN spec-decode).
-    // Must be set before output_norm so the MTP graph receives the raw hidden
-    // state h_{N-1} rather than the normed version.
-    if (hparams.nextn_predict_layers > 0) {
-        cb(cur, "h_pre_norm", -1);
-        res->t_h_pre_norm = cur;
-    }
+    // Always expose pre-norm hidden state. Used by:
+    //   1. MTP head streaming hook (when ctx_mtp registered)
+    //   2. Trainable tap capture via --tap-layers -1 (server eval callback intercepts
+    //      tensors named "h_pre_norm" mid-compute; bypasses post-compute buffer reuse)
+    cb(cur, "h_pre_norm", -1);
+    res->t_h_pre_norm = cur;
 
     cur = build_norm(cur,
             model.output_norm, NULL,

@@ -271,6 +271,7 @@ public:
     // tap-layer hidden-state dump — public so the C-API wrapper can call it
     void init_tap_layers(const char * dir, const std::vector<int> & layers, int n_embd,
                          int n_seq_max, bool merge_on_close);
+    void set_cb_eval(ggml_backend_sched_eval_callback cb, void * ud);
 
 private:
     llm_graph_params graph_params(

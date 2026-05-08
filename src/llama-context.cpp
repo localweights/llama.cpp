@@ -4253,3 +4253,15 @@ void llama_opt_epoch(
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
 }
+
+
+void llama_context::set_cb_eval(ggml_backend_sched_eval_callback cb, void * ud) {
+    cparams.cb_eval = cb;
+    cparams.cb_eval_user_data = ud;
+}
+
+void llama_set_eval_callback(struct llama_context * ctx, ggml_backend_sched_eval_callback callback, void * user_data) {
+    if (!ctx) return;
+    ctx->set_cb_eval(callback, user_data);
+    ggml_backend_sched_set_eval_callback(ctx->get_sched(), callback, user_data);
+}

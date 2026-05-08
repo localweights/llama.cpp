@@ -21,6 +21,8 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <fstream>
+#include <cstring>
 #include <sstream>
 #include <utility>
 
@@ -826,6 +828,44 @@ private:
     int slots_debug = 0;
     int n_empty_consecutive = 0;
 
+    // tap-layer h_pre_norm eval-callback path (L=-1 sentinel)
+    // Writes f16 rows to <tap_out_dir>/h_pre_norm.bin DURING graph compute,
+    // bypassing post-compute buffer reuse that affects the named-tensor scan path.
+    std::ofstream tap_h_pre_norm_file;
+
+    static bool tap_h_pre_norm_eval_cb(struct ggml_tensor * t, bool ask, void * ud) {
+        auto * self = static_cast<server_context_impl *>(ud);
+        if (!self) return ask ? false : true;
+        if (!t->name || std::strcmp(t->name, "h_pre_norm") != 0) return ask ? false : true;
+        if (ask) return true;
+        if (!self->tap_h_pre_norm_file.is_open()) return true;
+        const size_t nbytes = ggml_nbytes(t);
+        const size_t elem_sz = ggml_element_size(t);
+        const size_t n_elem = nbytes / elem_sz;
+        std::vector<uint8_t> host(nbytes);
+        ggml_backend_tensor_get(t, host.data(), 0, nbytes);
+        std::vector<ggml_fp16_t> half(n_elem);
+        if (t->type == GGML_TYPE_F32) {
+            const float * f32 = (const float *) host.data();
+            for (size_t k = 0; k < n_elem; k++) half[k] = ggml_fp32_to_fp16(f32[k]);
+        } else if (t->type == GGML_TYPE_F16) {
+            std::memcpy(half.data(), host.data(), n_elem * sizeof(ggml_fp16_t));
+        } else if (t->type == GGML_TYPE_BF16) {
+            const uint16_t * bf = (const uint16_t *) host.data();
+            for (size_t k = 0; k < n_elem; k++) {
+                uint32_t u = ((uint32_t) bf[k]) << 16;
+                float f;
+                std::memcpy(&f, &u, sizeof(float));
+                half[k] = ggml_fp32_to_fp16(f);
+            }
+        } else {
+            return true;
+        }
+        self->tap_h_pre_norm_file.write((const char *) half.data(), n_elem * sizeof(ggml_fp16_t));
+        self->tap_h_pre_norm_file.flush();
+        return true;
+    }
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -1192,9 +1232,11 @@ private:
             if (!tap_layer_vec.empty()) {
                 const int n_layer = llama_model_n_layer(model);
                 bool ok = true;
+                bool has_neg1 = false;
                 for (int L : tap_layer_vec) {
+                    if (L == -1) { has_neg1 = true; continue; }
                     if (L < 0 || L >= n_layer) {
-                        SRV_ERR("--tap-layers: layer %d out of range [0, %d)\n", L, n_layer);
+                        SRV_ERR("--tap-layers: layer %d out of range [0, %d) or -1\n", L, n_layer);
                         ok = false;
                     }
                 }
@@ -1206,13 +1248,31 @@ private:
                     } else {
                         SRV_INF("tap-dump: n_seq_max=%d, merge_on_close=%s\n",
                                 n_seq_max, params_base.tap_merge_on_close ? "true" : "false");
-                        llama_init_tap_layers(ctx,
-                                             params_base.tap_out_dir.c_str(),
-                                             tap_layer_vec.data(),
-                                             (int)tap_layer_vec.size(),
-                                             n_embd,
-                                             n_seq_max,
-                                             params_base.tap_merge_on_close);
+                        // Filter out L=-1 before calling llama_init_tap_layers (host
+                        // path supports only numbered layers via post-compute name scan).
+                        std::vector<int> numbered;
+                        for (int L : tap_layer_vec) if (L != -1) numbered.push_back(L);
+                        if (!numbered.empty()) {
+                            llama_init_tap_layers(ctx,
+                                                 params_base.tap_out_dir.c_str(),
+                                                 numbered.data(),
+                                                 (int)numbered.size(),
+                                                 n_embd,
+                                                 n_seq_max,
+                                                 params_base.tap_merge_on_close);
+                        }
+                        // L=-1 sentinel: capture h_pre_norm via eval callback
+                        if (has_neg1) {
+                            std::filesystem::create_directories(params_base.tap_out_dir);
+                            const std::string fpath = params_base.tap_out_dir + "/h_pre_norm.bin";
+                            tap_h_pre_norm_file.open(fpath, std::ios::binary | std::ios::app);
+                            if (!tap_h_pre_norm_file.is_open()) {
+                                SRV_ERR("tap: failed to open '%s'\n", fpath.c_str());
+                            } else {
+                                SRV_INF("tap: registering eval callback for h_pre_norm -> %s\n", fpath.c_str());
+                                llama_set_eval_callback(ctx, &server_context_impl::tap_h_pre_norm_eval_cb, this);
+                            }
+                        }
                     }
                 }
             }
