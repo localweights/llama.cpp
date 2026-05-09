@@ -49,6 +49,25 @@ void common_speculative_print_stats(const common_speculative * spec);
 // on the next request assigned to the same slot.
 void common_speculative_reset_kv(common_speculative * spec);
 
+// Phase D.1: Direct-commit query.
+//
+// After a tree-mode draft() call, returns the number of accepted tokens that
+// were committed directly to the trunk slot_seq KV (>= 0), or -1 if the last
+// draft was not tree-committed (linear mode or tree verify failed).
+//
+// When >= 0:
+//   - The accepted tokens are in the draft_tokens returned by common_speculative_draft().
+//   - Their KV (at n_past..n_past+n_committed) is already in slot_seq's KV.
+//   - The caller MUST NOT re-submit those tokens to trunk; instead decode only
+//     the correction token (from common_speculative_tree_correction()) at
+//     n_past+n_committed+1 (which IS slot_seq's current pos_next after commit).
+//   - After using this result, it is automatically reset on the next draft() call.
+int32_t     common_speculative_tree_n_committed(const common_speculative * spec);
+
+// Returns the correction token from the last tree verify, or -1 if not available.
+// Valid only when common_speculative_tree_n_committed() >= 0.
+llama_token common_speculative_tree_correction(const common_speculative * spec);
+
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
 };

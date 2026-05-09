@@ -1,27 +1,21 @@
-// EAGLE-2 Phase C: trunk verification with per-path seq_ids
+// EAGLE-2 Phase D: eliminate double trunk decode + per-leaf MTP KV management
 // tree-spec.cpp — multi-depth tree drafting + trunk verification
 //
-// Phase B: multi-depth tree expansion.
-// Phase C (new): trunk verification of all tree paths in one forward pass.
+// Phase D.1: Direct KV commit after mtp_tree_verify.
+//   After finding the accepted path, copy the path's KV (n_past..n_past+n_acc)
+//   from path seq_id into slot_seq, so the caller only needs to decode one
+//   correction token rather than re-decoding the full accepted prefix.
+//
+// Phase D.2: Per-leaf MTP seq_ids in ctx_mtp.
+//   Instead of wiping ctx_mtp KV between depths and using seq_id=0 for all
+//   leaves, each root-to-leaf path gets a unique seq_id in ctx_mtp.  Before
+//   expanding depth d+1 children of leaf L, we copy L's MTP KV to each child's
+//   seq_id, so each child sees the full ancestor history.
+//   ctx_mtp must have n_seq_max >= number of leaf paths.
 //
 // Phase B: static fixed-topology tree of width K and depth D.
-//   depth 0: K children of root  (same as Phase A)
-//   depth 1: K children of each depth-0 node  →  K² nodes total at depth 1
-//   ...
-//   depth D-1: K^D leaves total
-//
-// Phase C: trunk verification via per-path seq_ids.
-//   1. Build children index per node.
-//   2. Enumerate all root-to-leaf paths; assign unique seq_ids.
-//   3. For each path: llama_memory_seq_cp(ctx_tgt, src=slot_seq, dst=path_seq).
-//   4. Build a trunk batch: one entry per non-root node, seq_id=path's seq_id.
-//   5. llama_decode(ctx_tgt, batch).
-//   6. Walk tree greedily from root: accept if trunk argmax == child token.
-//   7. Remove all path seq_ids from ctx_tgt KV.
-//   8. Return accepted tokens + correction token.
-//
-// NOTE: MTP KV management is still "cold" per depth (Phase D will fix).
-// Trunk KV is managed correctly via seq_id copy/remove.
+// Phase C: trunk verification via per-path seq_ids (single llama_decode).
+// Phase D: see above.
 
 #include "tree-spec.h"
 
@@ -90,6 +84,7 @@ bool mtp_tree_draft(
         int32_t                      n_embd,
         llama_token                  id_last,
         llama_pos                    pos_start,
+        uint32_t                     n_seq_max_mtp,
         std::vector<mtp_tree_node> & nodes_out,
         mtp_h_vecs                 & h_vecs_out,
         llama_tokens               & draft_tokens) {
@@ -109,6 +104,19 @@ bool mtp_tree_draft(
 
     GGML_ASSERT((int32_t)root_h_vec.size() == n_embd);
 
+    // Phase D.2: determine whether per-leaf MTP seq_ids are available.
+    // We need up to K^D seq_ids (one per leaf path).  If n_seq_max_mtp < that,
+    // fall back to the Phase B "cold" approach (all seq_id=0).
+    //
+    // Maximum number of leaf paths for a K-ary tree of depth D:
+    //   n_paths_max = min(K^D, max_nodes / K) ... exact depends on tree shape.
+    // Conservative upper bound: cfg.max_nodes (one seq per node).
+    const bool use_per_leaf_kv = (n_seq_max_mtp >= (uint32_t)std::min(cfg.max_nodes, 255));
+    LOG_DBG("%s: n_seq_max_mtp=%u, use_per_leaf_kv=%d\n",
+            __func__, n_seq_max_mtp, (int)use_per_leaf_kv);
+
+    llama_memory_t mem_mtp = llama_get_memory(ctx_mtp);
+
     // ------------------------------------------------------------------
     // Initialize node array.
     // nodes_out[0] = root sentinel (depth = -1, holds id_last).
@@ -117,8 +125,15 @@ bool mtp_tree_draft(
     nodes_out.clear();
     h_vecs_out.clear();
 
+    // Clear all ctx_mtp KV from pos_start onwards before starting.
+    // This ensures a clean slate regardless of previous draft cycles.
+    for (llama_seq_id sid = 0; sid < (llama_seq_id)n_seq_max_mtp; ++sid) {
+        llama_memory_seq_rm(mem_mtp, sid, pos_start, -1);
+    }
+
     // Root sentinel: we need its MTP output h-state to seed depth-0.
     // Do a single root forward to get root logits AND root MTP output h-state.
+    // Root always uses seq_id=0.
     {
         std::memcpy(batch.embd, root_h_vec.data(), row_bytes);
         batch.token[0]      = id_last;
@@ -154,7 +169,7 @@ bool mtp_tree_draft(
     }
     auto root_topk = argtop_k_logprobs(root_logits, n_vocab, Keff);
 
-    // Root sentinel node
+    // Root sentinel node: mtp_seq_id=0 (same seq as root forward)
     {
         mtp_tree_node root;
         root.token        = id_last;
@@ -162,22 +177,39 @@ bool mtp_tree_draft(
         root.depth        = -1;
         root.log_prob     = 0.0f;
         root.cum_log_prob = 0.0f;
+        root.mtp_seq_id   = 0;
         nodes_out.push_back(root);
         h_vecs_out.push_back(root_mtp_out);
     }
 
     // ------------------------------------------------------------------
     // Depth expansion loop: d = 0 .. D-1
-    // At each iteration we:
-    //   - collect all leaves at depth (d-1) from nodes_out
-    //   - build a batch of all those leaves using their h-states from h_vecs_out
-    //   - run one llama_decode
-    //   - append K children per leaf into nodes_out / h_vecs_out
+    //
+    // Phase D.2 per-leaf KV strategy:
+    //   Before expanding depth d, each leaf L at depth (d-1) has its MTP KV
+    //   at positions pos_start..pos_start+d-1 under seq_id L.mtp_seq_id.
+    //   When we expand L's K children, we assign each child a new seq_id and
+    //   copy L's MTP KV to each child's seq_id before the decode.
+    //   The decode batch for depth d thus has:
+    //     - one entry per leaf, using the child's seq_id
+    //     - pos = pos_start + d
+    //   After decode, the child's KV at pos_start+d is set.
+    //
+    // Phase B fallback (use_per_leaf_kv=false):
+    //   All entries use seq_id=0; KV wiped at pos_d before each depth.
+    //   Same behavior as Phase B/C.
+    //
+    // seq_id assignment:
+    //   Root = 0 (already decoded).
+    //   Depth-0 children: seq_ids 1..K (or same 0 for fallback).
+    //   Depth-1 children: new seq_ids K+1.. etc.
+    //   We use next_mtp_seq (starting at 1) and increment for each new leaf.
     // ------------------------------------------------------------------
+
+    llama_seq_id next_mtp_seq = 1; // next available seq_id in ctx_mtp (0 is root)
 
     for (int32_t d = 0; d < D; ++d) {
         // Collect indices of nodes at depth (d-1).
-        // Depth -1 = root sentinel, depth 0..D-1 = expansion levels.
         const int32_t parent_depth = d - 1;
         std::vector<int32_t> leaves;
         for (int32_t ni = 0; ni < (int32_t)nodes_out.size(); ++ni) {
@@ -186,7 +218,7 @@ bool mtp_tree_draft(
             }
         }
 
-        // Budget check: if adding K*|leaves| nodes would exceed max_nodes, truncate.
+        // Budget check
         const int32_t remaining = cfg.max_nodes - (int32_t)nodes_out.size();
         if (remaining <= 0) {
             LOG_DBG("%s: node budget exhausted at depth %d (nodes=%d)\n",
@@ -200,32 +232,79 @@ bool mtp_tree_draft(
         }
 
         const int32_t n_leaves  = (int32_t)leaves.size();
-        const llama_pos pos_d   = pos_start + d + 1; // position for this depth
+        const llama_pos pos_d   = pos_start + d; // position for this depth
+        // Root sentinel was at pos_start, so depth-0 children are at pos_start+1... wait:
+        // Root is at pos_start. depth-0 is the first set of children.
+        // Actually in the original code: root forward is at pos_start, depth-0 at pos_start+1, etc.
+        // Let's keep the same convention: depth d children are at pos_start + d + 1.
+        const llama_pos pos_children = pos_start + d + 1;
 
-        // Clear ctx_mtp KV at pos_d and beyond to avoid collisions from prior
-        // iterations writing to the same absolute position.
-        // This makes MTP attention "cold" at each depth — acceptable for Phase B.
-        llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, pos_d, -1);
+        if (!use_per_leaf_kv) {
+            // Phase B fallback: wipe pos_d+1 and beyond from seq_id=0.
+            llama_memory_seq_rm(mem_mtp, 0, pos_children, -1);
+        }
 
-        // Build the batch: one slot per leaf, embedding = that leaf's h-state.
+        // Build the batch: one slot per leaf.
+        // Phase D.2: each leaf child gets a new seq_id; copy parent's MTP KV first.
+        // Phase B fallback: all slots use seq_id=0.
+
+        // For Phase D.2: pre-assign seq_ids for the children we're about to create.
+        // We need Keff * n_leaves new seq_ids; check budget.
+        std::vector<llama_seq_id> leaf_child_base(n_leaves, 0); // base seq_id for first child of each leaf
+
+        if (use_per_leaf_kv) {
+            // Check seq_id budget
+            const int32_t n_new_seqs = Keff * n_leaves;
+            if ((int32_t)next_mtp_seq + n_new_seqs > (int32_t)n_seq_max_mtp) {
+                LOG_WRN("%s: MTP seq_id budget exceeded at depth %d "
+                        "(need %d, have %d remaining). Falling back to cold KV.\n",
+                        __func__, d, n_new_seqs, (int)(n_seq_max_mtp - next_mtp_seq));
+                // Fall back to cold for this and deeper depths
+                for (int32_t li = 0; li < n_leaves; ++li) {
+                    leaf_child_base[li] = 0;
+                }
+                llama_memory_seq_rm(mem_mtp, 0, pos_children, -1);
+            } else {
+                for (int32_t li = 0; li < n_leaves; ++li) {
+                    leaf_child_base[li] = next_mtp_seq;
+                    next_mtp_seq += Keff;
+                }
+            }
+        }
+
+        // Build batch: one entry per leaf (using its first child's seq_id for the decode,
+        // then we'll use the output for all Keff children).
         batch.n_tokens = n_leaves;
         for (int32_t li = 0; li < n_leaves; ++li) {
             const int32_t ni = leaves[li];
-            // Use the parent node's MTP output h-state as embedding for this depth.
-            // h_vecs_out[ni] contains the MTP out h-state generated when that
-            // node was processed (or root_mtp_out for the root sentinel).
             const std::vector<float> & h_src = h_vecs_out[ni];
+
             if ((int32_t)h_src.size() == n_embd) {
                 std::memcpy(batch.embd + (size_t)li * n_embd, h_src.data(), row_bytes);
             } else {
-                // Fallback: zero-fill if h-state wasn't captured
                 std::memset(batch.embd + (size_t)li * n_embd, 0, row_bytes);
             }
             batch.token[li]     = nodes_out[ni].token;
-            batch.pos[li]       = pos_d;
+            batch.pos[li]       = pos_children;
             batch.n_seq_id[li]  = 1;
-            batch.seq_id[li][0] = 0;
             batch.logits[li]    = 1;
+
+            if (use_per_leaf_kv && leaf_child_base[li] > 0) {
+                // Use first child's seq_id for this leaf's decode.
+                // The seq_id must have a copy of the parent's MTP KV so attention
+                // sees the full history.
+                const llama_seq_id parent_mtp_seq = nodes_out[ni].mtp_seq_id;
+                const llama_seq_id child_seq_base = leaf_child_base[li];
+                // Copy parent KV to all Keff child seq_ids.
+                for (int32_t ki = 0; ki < Keff; ++ki) {
+                    llama_memory_seq_cp(mem_mtp, parent_mtp_seq,
+                                        child_seq_base + ki, 0, -1);
+                }
+                // Run this leaf's decode under the first child's seq_id.
+                batch.seq_id[li][0] = child_seq_base;
+            } else {
+                batch.seq_id[li][0] = 0;
+            }
         }
 
         // Run the parallel MTP forward for this depth.
@@ -234,8 +313,7 @@ bool mtp_tree_draft(
             const int32_t rc = llama_decode(ctx_mtp, batch);
             if (rc != 0) {
                 LOG_WRN("%s: depth-%d llama_decode rc=%d (n_leaves=%d, pos=%d)\n",
-                        __func__, d, rc, n_leaves, (int)pos_d);
-                // Partial tree is still usable — stop expansion here.
+                        __func__, d, rc, n_leaves, (int)pos_children);
                 break;
             }
         }
@@ -265,10 +343,26 @@ bool mtp_tree_draft(
 
             auto topk = argtop_k_logprobs(slot_logits, n_vocab, Keff);
 
-            // Log top-1 for sanity.
             LOG_DBG("%s:   leaf[%d] node=%d tok=%d -> child[0]=%d (logp=%.3f)\n",
                     __func__, li, parent_ni, (int)nodes_out[parent_ni].token,
                     (int)topk[0].first, (double)topk[0].second);
+
+            // The decode ran under leaf_child_base[li] (seq_id for ki=0).
+            // ki=0 already has the KV written; ki=1..Keff-1 were pre-copied from parent
+            // but the NEW position (pos_children) needs to be assigned to each child.
+            // Since all Keff children share the same parent KV history and diverge at
+            // pos_children, we:
+            //   - ki=0: KV already written by llama_decode (seq = leaf_child_base[li]+0)
+            //   - ki=1..Keff-1: copy ki=0's new position into each sibling seq_id.
+            if (use_per_leaf_kv && leaf_child_base[li] > 0) {
+                const llama_seq_id base = leaf_child_base[li];
+                // KV at pos_children is under base (ki=0).
+                // Copy that single position to ki=1..Keff-1.
+                for (int32_t ki = 1; ki < Keff; ++ki) {
+                    llama_memory_seq_cp(mem_mtp, base, base + ki,
+                                        pos_children, pos_children + 1);
+                }
+            }
 
             for (int32_t ki = 0; ki < (int32_t)topk.size(); ++ki) {
                 mtp_tree_node child;
@@ -278,9 +372,15 @@ bool mtp_tree_draft(
                 child.log_prob     = topk[ki].second;
                 child.cum_log_prob = nodes_out[parent_ni].cum_log_prob + topk[ki].second;
 
+                if (use_per_leaf_kv && leaf_child_base[li] > 0) {
+                    child.mtp_seq_id = leaf_child_base[li] + ki;
+                } else {
+                    child.mtp_seq_id = 0;
+                }
+
                 nodes_out.push_back(child);
-                // All children at this depth share the leaf's MTP out h-state
-                // (they all feed the same parent, same decode output).
+                // All children at this depth share the same MTP out h-state
+                // (same forward pass output — they diverge in future depths).
                 h_vecs_out.push_back(child_h);
             }
         }
@@ -288,19 +388,15 @@ bool mtp_tree_draft(
 
     // ------------------------------------------------------------------
     // Build path-0 draft tokens: leftmost branch from each depth.
-    // root (depth=-1) → first child at depth=0 → first child at depth=1 → …
-    // "first child" = lowest node index at that depth that is a child of the
-    // current path node.
     // ------------------------------------------------------------------
     draft_tokens.clear();
     int32_t cur = 0; // root sentinel index
     for (int32_t d = 0; d < D; ++d) {
-        // Find first child of cur at depth d
         int32_t first_child = -1;
         for (int32_t ni = 0; ni < (int32_t)nodes_out.size(); ++ni) {
             if (nodes_out[ni].depth == d && nodes_out[ni].parent_idx == cur) {
                 first_child = ni;
-                break; // nodes appended in order, so first match = leftmost
+                break;
             }
         }
         if (first_child < 0) break;
@@ -308,8 +404,10 @@ bool mtp_tree_draft(
         cur = first_child;
     }
 
-    LOG_INF("%s: tree branching=%d max_depth=%d total_nodes=%d drafted %d path-0 tokens\n",
-            __func__, Keff, D, (int)nodes_out.size(), (int)draft_tokens.size());
+    LOG_INF("%s: tree branching=%d max_depth=%d total_nodes=%d drafted %d path-0 tokens "
+            "(per_leaf_kv=%d, mtp_seqs_used=%d)\n",
+            __func__, Keff, D, (int)nodes_out.size(), (int)draft_tokens.size(),
+            (int)use_per_leaf_kv, (int)next_mtp_seq);
 
     return true;
 }
@@ -336,14 +434,18 @@ int32_t mtp_tree_verify(
         llama_seq_id                  slot_seq,
         llama_seq_id                  base_seq,
         uint32_t                      n_seq_max,
-        llama_tokens                & accepted_out) {
+        bool                          commit_to_slot,
+        llama_tokens                & accepted_out,
+        llama_token                 & correction_out) {
 
     accepted_out.clear();
+    correction_out = -1;
 
     const int32_t n_nodes = (int32_t)nodes.size();
     if (n_nodes <= 1) {
         // Only root sentinel — nothing to verify.
         LOG_WRN("%s: tree has no draft nodes (n_nodes=%d)\n", __func__, n_nodes);
+        correction_out = -1;
         return 0;
     }
 
@@ -429,6 +531,7 @@ int32_t mtp_tree_verify(
         LOG_ERR("%s: seq_id overflow (need up to %d, n_seq_max=%u). "
                 "Reduce tree size or set --parallel higher. Falling back.\n",
                 __func__, (int)next_seq_id, n_seq_max);
+        correction_out = -1;
         return 0;
     }
 
@@ -543,36 +646,36 @@ int32_t mtp_tree_verify(
         for (llama_seq_id sid : used_seq_ids) {
             llama_memory_seq_rm(mem_tgt, sid, 0, -1);
         }
+        correction_out = -1;
         return 0;
     }
 
     // ------------------------------------------------------------------
     // Step 6: Accept walk — greedy tree traversal from root.
     //
-    // At each step:
-    //   - Read trunk logits at cur_node.batch_idx.
-    //     For root (batch_idx=0 = root probe): logits predict depth-0 token.
-    //     For non-root at depth d: logits predict depth-(d+1) token.
-    //   - trunk_tok = argmax(logits).
-    //   - Find child whose token == trunk_tok.
-    //   - If found: accept, descend to that child.
-    //   - If not found: correction = trunk_tok, stop.
+    // accepted_out = [accepted_tok_0, ..., accepted_tok_{k-1}] (length = n_accepted)
+    // correction_out = the correction token (always set)
     //
-    // accepted_out = [accepted_tok_0, ..., accepted_tok_k, correction_tok]
-    // (length = n_accepted + 1; always at least 1 = correction only).
+    // Phase D.1 change: correction is returned separately.  The caller (server)
+    // needs only correction_out to generate the next token; it does not need to
+    // re-run the full accepted prefix through the trunk.
     // ------------------------------------------------------------------
-    int32_t n_accepted = 0;
-    int32_t cur_node   = 0; // root sentinel
+    int32_t n_accepted   = 0;
+    int32_t cur_node     = 0; // root sentinel
+    int32_t accepted_seq = -1; // seq_id of the accepted path (for D.1 commit)
 
     for (;;) {
         const int32_t cur_bidx = nodes[cur_node].batch_idx;
         if (cur_bidx < 0) {
             LOG_ERR("%s: node %d has batch_idx=-1 (unexpected)\n", __func__, cur_node);
+            // Emit fallback correction (id_last) so caller isn't stuck.
+            correction_out = id_last;
             break;
         }
         const float * logits = llama_get_logits_ith(ctx_tgt, cur_bidx);
         if (!logits) {
             LOG_ERR("%s: null logits at batch_idx=%d\n", __func__, cur_bidx);
+            correction_out = id_last;
             break;
         }
         const llama_token trunk_tok = (llama_token)argmax_f32(logits, n_vocab);
@@ -595,42 +698,72 @@ int32_t mtp_tree_verify(
             // Accept this child's token.
             accepted_out.push_back(trunk_tok);
             nodes[match].verified = true;
+            accepted_seq = nodes[match].kv_seq_id; // track which path seq we're on
             cur_node = match;
             ++n_accepted;
         } else {
-            // Rejection: trunk_tok is the correction.  Always emit it.
-            accepted_out.push_back(trunk_tok);
+            // Rejection: trunk_tok is the correction.
+            correction_out = trunk_tok;
             break;
         }
 
-        // If we've accepted a leaf (no children), also emit correction from leaf logits.
+        // If we've accepted a leaf (no children), get correction from leaf logits.
         if (nodes[cur_node].children.empty()) {
             const int32_t leaf_bidx = nodes[cur_node].batch_idx;
             if (leaf_bidx >= 0) {
                 const float * leaf_logits = llama_get_logits_ith(ctx_tgt, leaf_bidx);
                 if (leaf_logits) {
-                    const llama_token leaf_correction = (llama_token)argmax_f32(leaf_logits, n_vocab);
-                    accepted_out.push_back(leaf_correction);
-                    LOG_DBG("%s: leaf correction=%d\n", __func__, (int)leaf_correction);
+                    correction_out = (llama_token)argmax_f32(leaf_logits, n_vocab);
+                    LOG_DBG("%s: leaf correction=%d\n", __func__, (int)correction_out);
+                } else {
+                    correction_out = id_last; // fallback
                 }
+            } else {
+                correction_out = id_last; // fallback
             }
             break;
         }
     }
 
-    LOG_INF("%s: tree verify: %d draft tokens accepted, accepted_out.size=%d\n",
-            __func__, n_accepted, (int)accepted_out.size());
+    LOG_INF("%s: tree verify: %d draft tokens accepted, correction=%d\n",
+            __func__, n_accepted, (int)correction_out);
 
     // ------------------------------------------------------------------
-    // Step 7: Cleanup — remove all path seq_ids from ctx_tgt's KV.
+    // Step 7: Phase D.1 — direct commit.
+    //
+    // If commit_to_slot=true and we have an accepted path (n_accepted > 0),
+    // copy the accepted positions from the path's seq_id into slot_seq.
+    // This includes:
+    //   - n_past         (id_last via root probe under accepted_seq)
+    //   - n_past+1       (first accepted token at depth 0)
+    //   - ...
+    //   - n_past+n_accepted  (last accepted token)
+    //
+    // After copy, the caller only needs to decode the correction token at
+    // n_past+n_accepted+1, rather than the full [id_last, tok0, ..., tok_n_acc].
+    //
+    // If commit_to_slot=false (Phase C compat) or n_accepted==0, skip commit.
+    // (When n_accepted==0 the caller still does the normal single-token decode.)
+    // ------------------------------------------------------------------
+    if (commit_to_slot && n_accepted > 0 && accepted_seq >= 0) {
+        // Copy positions n_past .. n_past+n_accepted (inclusive) from accepted_seq to slot_seq.
+        // p1 is exclusive, so p1 = n_past + n_accepted + 1.
+        llama_memory_seq_cp(mem_tgt, (llama_seq_id)accepted_seq, slot_seq,
+                            n_past, n_past + n_accepted + 1);
+        LOG_DBG("%s: D.1 commit: copied pos [%d..%d] from seq %d to slot_seq %d\n",
+                __func__, (int)n_past, (int)(n_past + n_accepted),
+                (int)accepted_seq, (int)slot_seq);
+    }
+
+    // ------------------------------------------------------------------
+    // Step 8: Cleanup — remove all path seq_ids from ctx_tgt's KV.
     // ------------------------------------------------------------------
     for (llama_seq_id sid : used_seq_ids) {
         llama_memory_seq_rm(mem_tgt, sid, 0, -1);
     }
-    // slot_seq was NOT written to during tree verify (no root probe under slot_seq).
-    // The server's normal trunk batch will write id_last at n_past under slot_seq cleanly.
-    LOG_DBG("%s: removed %d path seq_ids from ctx_tgt KV (slot_seq=%d untouched)\n",
-            __func__, n_paths, (int)slot_seq);
+    LOG_DBG("%s: removed %d path seq_ids from ctx_tgt KV (slot_seq=%d%s)\n",
+            __func__, n_paths, (int)slot_seq,
+            (commit_to_slot && n_accepted > 0) ? " — committed accepted path" : "");
 
     return n_accepted;
 }

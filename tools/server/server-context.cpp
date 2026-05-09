@@ -1074,7 +1074,18 @@ private:
             // The shared cparams template is stored here; seq_id is set per-slot at init time.
             auto cparams_mtp = common_context_params_to_llama(params_base);
             cparams_mtp.n_ctx     = llama_n_ctx_seq(ctx);
-            cparams_mtp.n_seq_max = 1; // each ctx_mtp is a single-seq context
+            // Phase D.2: bump ctx_mtp n_seq_max to support per-leaf MTP KV.
+            // For a tree of branching K and depth D, we need up to K^D seq_ids.
+            // Use tree_max_nodes as a conservative upper bound (capped at 64).
+            {
+                const bool has_tree = params_base.speculative.mtp.tree_branching > 1;
+                if (has_tree) {
+                    const int32_t n_mtp_seqs = std::min(params_base.speculative.mtp.tree_max_nodes, 64);
+                    cparams_mtp.n_seq_max = (uint32_t) n_mtp_seqs;
+                } else {
+                    cparams_mtp.n_seq_max = 1; // each ctx_mtp is a single-seq context
+                }
+            }
             cparams_mtp.n_rs_seq  = 0;
             // Forward MTP-debug eval callback so ctx_mtp graph tensors get tapped.
             if (std::getenv("LLAMA_MTP_TAP")) {
