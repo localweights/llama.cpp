@@ -1494,7 +1494,17 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
-    cparams.n_seq_max         = params.n_parallel;
+    {
+        // When EAGLE-2 tree drafting is active, bump n_seq_max to reserve room for
+        // per-path tree seq_ids.  Tree paths are assigned seq_ids starting at n_parallel
+        // and we need at most tree_max_nodes extra seq_ids (one per leaf in the worst case).
+        // Cap at LLAMA_MAX_SEQ - 1 to avoid overflow.
+        const bool has_tree = (params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) &&
+                              (params.speculative.mtp.tree_branching > 1);
+        const int32_t extra_seqs = has_tree ? params.speculative.mtp.tree_max_nodes : 0;
+        const int32_t raw_seq_max = params.n_parallel + extra_seqs;
+        cparams.n_seq_max = (uint32_t) std::min(raw_seq_max, 255); // cap below LLAMA_MAX_SEQ=256
+    }
     {
         // enable partial rollback only for MTP, each recurrent slot requires memory
         // and MTP uses max 3-4 slots vs other techniques

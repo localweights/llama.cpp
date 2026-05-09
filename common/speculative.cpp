@@ -614,7 +614,8 @@ struct common_speculative_state_mtp : public common_speculative_state {
     llama_context  * ctx_mtp = nullptr;
     llama_seq_id     seq_id  = 0;   // which trunk seq_id this slot drives
 
-    llama_batch       batch;       // single token draft step
+    llama_batch       batch;        // MTP draft batch (embedded tokens)
+    llama_batch       tgt_batch;    // trunk verification batch (Phase C tree verify)
     common_sampler  * smpl = nullptr;
     int32_t           n_embd = 0;
 
@@ -623,6 +624,12 @@ struct common_speculative_state_mtp : public common_speculative_state {
     int32_t  last_accepted_row     = -1;            // output row index; -1 = single-slot fallback
     std::vector<float> last_h_vec;                  // copied hidden state from t_h_pre_norm at accept/begin time
     bool     last_h_valid          = false;         // true iff last_h_vec is fresh for the current draft cycle
+
+    // Phase C tree verify: cached nodes and n_past from last tree draft.
+    // Used to pass tree state to verify step within draft().
+    std::vector<mtp_tree_node> tree_nodes;          // built by mtp_tree_draft(), consumed by mtp_tree_verify()
+    llama_pos                  tree_n_past  = 0;    // trunk n_past at the time tree was built
+    llama_token                tree_id_last = 0;    // id_last at the time tree was built
 
     common_speculative_state_mtp(enum common_speculative_type type,
                                  llama_context * ctx_tgt,
@@ -654,12 +661,20 @@ struct common_speculative_state_mtp : public common_speculative_state {
         batch.seq_id[0][0] = 0; // ctx_mtp internal seq; always 0
         batch.logits[0]    = 1;
 
+        // Trunk verification batch (Phase C): capacity = 2*TREE_SPEC_MAX_BATCH + 1
+        // (1 root probe slot_seq + up to TREE_SPEC_MAX_BATCH path root probes +
+        // up to TREE_SPEC_MAX_BATCH tree nodes).
+        // n_seq_max=1 here because each token specifies its own seq_id explicitly.
+        tgt_batch = llama_batch_init(/*n_tokens=*/ 2 * TREE_SPEC_MAX_BATCH + 1,
+                                     /*embd=*/ 0, /*n_seq_max=*/ 1);
+
         llama_set_mtp(ctx_tgt, seq_id, ctx_mtp);
     }
 
     ~common_speculative_state_mtp() override {
         llama_set_mtp(ctx_tgt, seq_id, nullptr);
         llama_batch_free(batch);
+        llama_batch_free(tgt_batch);
         common_sampler_free(smpl);
         if (ctx_mtp) {
             llama_free(ctx_mtp);
@@ -736,10 +751,21 @@ struct common_speculative_state_mtp : public common_speculative_state {
         llama_pos   pos      = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0) + 1;
 
         // EAGLE-2 tree drafting (Phase A): parallel MTP forward.
-        // When tree_branching > 1, delegate to mtp_tree_draft() instead of
-        // the AR loop below.  For Phase A the accepted path is still linear
-        // (leftmost branch only) so the accept rate is identical to branching=1.
-        // This block proves that n_tokens>1 MTP decode works correctly.
+        // EAGLE-2 tree drafting (Phase C): parallel MTP forward + trunk verification.
+        // When tree_branching > 1, delegate to mtp_tree_draft() to build the tree
+        // and then call mtp_tree_verify() to run a single trunk forward pass over
+        // all tree paths with per-path seq_ids.
+        //
+        // draft_tokens returned here are the VERIFIED accepted tokens (including the
+        // correction token appended by verify).  The caller will re-run them through
+        // the normal trunk decode, which is a no-op for the prompt KV (the tree verify
+        // already cleaned up its auxiliary seq_ids, so this re-decode writes the tokens
+        // back under the slot seq_id).
+        //
+        // NOTE: Phase C uses base_seq = seq_id + 1, which is correct for single-slot
+        // (--parallel 1).  Multi-slot support requires per-slot non-overlapping ranges;
+        // this is a Phase E concern.  n_seq_max is bumped at context creation time
+        // (common.cpp) to accommodate tree path seq_ids.
         if (params.mtp.tree_branching > 1) {
             // Resolve root hidden state (same logic as the AR loop below)
             std::vector<float> root_h(n_embd, 0.0f);
@@ -775,15 +801,61 @@ struct common_speculative_state_mtp : public common_speculative_state {
             cfg.max_nodes = params.mtp.tree_max_nodes;
             cfg.p_min     = params.mtp.tree_p_min;
 
-            std::vector<mtp_tree_node> nodes;
             mtp_h_vecs h_vecs;
+            tree_nodes.clear();
+            tree_id_last = cond_tok;
+            tree_n_past  = pos;  // MTP pos == trunk n_past (synchronized)
 
+            llama_tokens path0_tokens; // Phase B path-0 fallback (discarded if verify succeeds)
             const bool ok = mtp_tree_draft(ctx_mtp, batch, cfg, root_h,
                                            n_embd, cond_tok, pos,
-                                           nodes, h_vecs, draft_tokens);
-            if (!ok) {
-                LOG_WRN("%s: [tree] mtp_tree_draft failed; falling back to 0 drafts\n", __func__);
+                                           tree_nodes, h_vecs, path0_tokens);
+            if (!ok || tree_nodes.size() <= 1) {
+                LOG_WRN("%s: [tree] mtp_tree_draft failed or empty tree; "
+                        "falling back to 0 drafts\n", __func__);
                 draft_tokens.clear();
+                last_n_drafted = 0;
+                return;
+            }
+
+            // Phase C: run trunk verification over all tree paths.
+            // base_seq = seq_id + 1 (tree paths use seq_ids above the slot seq_id).
+            // slot_seq = seq_id (the trunk seq_id holding the prompt KV).
+            const llama_seq_id slot_seq  = (llama_seq_id)seq_id;
+            const llama_seq_id base_seq  = (llama_seq_id)(seq_id + 1);
+            const uint32_t     n_seq_max = llama_n_seq_max(ctx_tgt);
+
+            llama_tokens accepted;
+            const int32_t n_acc = mtp_tree_verify(
+                ctx_tgt, tgt_batch, tree_nodes,
+                tree_n_past, tree_id_last,
+                slot_seq, base_seq, n_seq_max, accepted);
+
+            if (accepted.empty()) {
+                // Verify failed or returned nothing — fall back to path-0 linear result.
+                LOG_WRN("%s: [tree] mtp_tree_verify returned empty; "
+                        "falling back to path-0 (%d tokens)\n",
+                        __func__, (int)path0_tokens.size());
+                draft_tokens = path0_tokens;
+            } else {
+                // accepted = [acc_tok_0, ..., acc_tok_k, correction_tok] (length n_acc+1).
+                //
+                // The caller (server) will:
+                //   1. Submit [id_last @ n_past, draft_0 @ n_past+1, ...] to trunk.
+                //   2. Verify each draft token against trunk output.
+                //   3. Call common_speculative_accept() with n_accepted.
+                //
+                // We return only the ACCEPTED tokens (first n_acc elements), NOT the
+                // correction.  The caller's own trunk verify will compute the correction.
+                // The caller re-verifies n_acc tokens — this is a "re-decode" but since
+                // the tree KV was cleaned up, it is a clean write at n_past+1..n_past+n_acc.
+                //
+                // Returning accepted[0..n_acc-1] ensures correct MTP KV trimming via
+                // accept(): last_n_drafted = n_acc, and caller accepts exactly n_acc.
+                draft_tokens.assign(accepted.begin(),
+                                    accepted.begin() + n_acc); // exclude correction
+                LOG_INF("%s: [tree C] accepted=%d total_draft=%d\n",
+                        __func__, n_acc, (int)draft_tokens.size());
             }
 
             last_n_drafted = (uint16_t) draft_tokens.size();
