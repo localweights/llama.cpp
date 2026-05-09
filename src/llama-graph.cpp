@@ -840,6 +840,12 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_result::set_outputs() {
+    if (t_h_pre_norm != nullptr) {
+        ggml_set_output(t_h_pre_norm);
+    }
+    if (t_mtp_out != nullptr) {
+        ggml_set_output(t_mtp_out);
+    }
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
     }
@@ -1678,8 +1684,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     assert(n_expert_used > 0);
 
     // order the views before the adds
+    // ggml_cont forces contiguous strides — required to prevent CUDA fused-add
+    // (ggml_cuda_op_fused_add) from reading wrong byte offsets when n_tokens > 1.
+    // Affects qwen3moe-mtp prefill (handle_mtp_for_seq); silent KV corruption otherwise.
     for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+        cur_experts[i] = ggml_cont(ctx0,
+            ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]));
 
         ggml_build_forward_expand(gf, cur_experts[i]);
     }

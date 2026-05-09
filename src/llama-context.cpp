@@ -3689,7 +3689,47 @@ static void handle_mtp_for_seq(
         struct ggml_tensor     * t) {
     if (rows.empty()) return;
 
-    const size_t row_bytes = (size_t) n_embd * sizeof(float);
+    // hook_batch.embd is F32 (per MTP graph inp->embd type). Source tensor t may be
+    // F16/BF16/F32 depending on backend (CUDA fast path uses F16; CPU uses F32).
+    // We must convert per element when src dtype != F32 — naive memcpy reads wrong
+    // bytes (was hardcoded n_embd*sizeof(float) regardless of src type).
+    const size_t src_elt_bytes = ggml_type_size(t->type);
+    const size_t src_row_bytes = (size_t) n_embd * src_elt_bytes;
+    const size_t dst_row_bytes = (size_t) n_embd * sizeof(float);
+    const ggml_type src_type = t->type;
+
+    // Scratch buffer for non-F32 source rows.
+    std::vector<uint8_t> src_scratch;
+    if (src_type != GGML_TYPE_F32) {
+        src_scratch.resize(src_row_bytes);
+    }
+
+    auto get_row_as_f32 = [&](int global_row, float * dst_f32) {
+        if (src_type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(t, dst_f32,
+                (size_t) global_row * src_row_bytes, src_row_bytes);
+        } else {
+            ggml_backend_tensor_get(t, src_scratch.data(),
+                (size_t) global_row * src_row_bytes, src_row_bytes);
+            // Convert src dtype -> F32 in-place into dst_f32
+            const auto * traits = ggml_get_type_traits(src_type);
+            if (traits && traits->to_float) {
+                traits->to_float(src_scratch.data(), dst_f32, n_embd);
+            } else {
+                // Fallback: F16 fast path
+                if (src_type == GGML_TYPE_F16) {
+                    const ggml_fp16_t * src = (const ggml_fp16_t *) src_scratch.data();
+                    for (int64_t i = 0; i < n_embd; ++i) {
+                        dst_f32[i] = ggml_fp16_to_fp32(src[i]);
+                    }
+                } else {
+                    LLAMA_LOG_ERROR("%s: unsupported h_pre_norm src dtype %d\n",
+                                    __func__, (int) src_type);
+                    GGML_ABORT("unsupported h_pre_norm src dtype");
+                }
+            }
+        }
+    };
 
     // Skip if the seq already has this range in the MTP KV (re-prefill guard).
     const llama_pos pos_start = positions[rows[0]];
@@ -3710,7 +3750,7 @@ static void handle_mtp_for_seq(
         int out_idx = 0;
         if (pending_continues) {
             std::memcpy(slot.hook_batch.embd + (size_t) out_idx * n_embd,
-                        slot.pending_h.data(), row_bytes);
+                        slot.pending_h.data(), dst_row_bytes);
             slot.hook_batch.token[out_idx]     = tokens[rows[0]];
             slot.hook_batch.pos[out_idx]       = pos_start;
             slot.hook_batch.n_seq_id[out_idx]  = 1;
@@ -3720,10 +3760,7 @@ static void handle_mtp_for_seq(
         }
         for (int k = 0; k + 1 < n_rows; ++k) {
             const int global_row = rows[k];
-            ggml_backend_tensor_get(t,
-                slot.hook_batch.embd + (size_t) out_idx * n_embd,
-                (size_t) global_row * row_bytes,
-                row_bytes);
+            get_row_as_f32(global_row, slot.hook_batch.embd + (size_t) out_idx * n_embd);
             slot.hook_batch.token[out_idx]     = tokens[rows[k + 1]];
             slot.hook_batch.pos[out_idx]       = positions[rows[k + 1]];
             slot.hook_batch.n_seq_id[out_idx]  = 1;
@@ -3734,6 +3771,11 @@ static void handle_mtp_for_seq(
         GGML_ASSERT(out_idx == n_out);
         slot.hook_batch.n_tokens = n_out;
 
+        // CUDA fix (H_N): drain prior ctx_mtp compute on cuda_ctx->stream() before
+        // llama_decode dispatches new set_tensor on cudaStreamPerThread. The two
+        // streams have no implicit ordering — without explicit sync, the new input
+        // can be overwritten or read stale. CPU is sync so no race there.
+        llama_synchronize(slot.ctx_mtp);
         const int32_t rc_dec = llama_decode(slot.ctx_mtp, slot.hook_batch);
         if (rc_dec != 0) {
             LLAMA_LOG_ERROR("%s: llama_decode(ctx_mtp) failed rc=%d (seq_id=?, pos=%d, n=%d)\n",
@@ -3742,8 +3784,7 @@ static void handle_mtp_for_seq(
     }
 
     // Stash the last h-row of this seq as pending for the next ubatch.
-    ggml_backend_tensor_get(t, slot.pending_h.data(),
-        (size_t) rows.back() * row_bytes, row_bytes);
+    get_row_as_f32(rows.back(), slot.pending_h.data());
     slot.pending_pos = positions[rows.back()];
 }
 

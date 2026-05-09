@@ -186,6 +186,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     //   1. MTP head streaming hook (when ctx_mtp registered)
     //   2. Trainable tap capture via --tap-layers -1 (server eval callback intercepts
     //      tensors named "h_pre_norm" mid-compute; bypasses post-compute buffer reuse)
+    ggml_set_output(cur);
     cb(cur, "h_pre_norm", -1);
     res->t_h_pre_norm = cur;
 

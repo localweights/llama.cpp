@@ -803,6 +803,10 @@ struct common_speculative_state_mtp : public common_speculative_state {
             batch.token[0] = cond_tok;
             batch.pos[0]   = pos;
 
+            // CUDA fix (H_N): drain prior ctx_mtp compute on cuda_ctx->stream() before
+            // llama_decode dispatches new set_tensor on cudaStreamPerThread. Two streams
+            // have no implicit ordering. Required for correct multi-step draft chain.
+            llama_synchronize(ctx_mtp);
             const int32_t dec_rc = llama_decode(ctx_mtp, batch);
             if (dec_rc != 0) {
                 LOG_WRN("%s: llama_decode rc=%d at k=%d (seq_id=%d, pos=%d, ctx_mtp=%p); stopping chain\n",

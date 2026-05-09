@@ -24,6 +24,7 @@
 #include <fstream>
 #include <cstring>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -833,37 +834,91 @@ private:
     // bypassing post-compute buffer reuse that affects the named-tensor scan path.
     std::ofstream tap_h_pre_norm_file;
 
+    // MTP-debug tap: env LLAMA_MTP_TAP=name1,name2,... captures named tensors
+    // from the MTP graph into <tap_out_dir>/mtp_<name>.bin (f16, 16-byte header).
+    std::unordered_map<std::string, std::ofstream> tap_mtp_files;
+
     static bool tap_h_pre_norm_eval_cb(struct ggml_tensor * t, bool ask, void * ud) {
         auto * self = static_cast<server_context_impl *>(ud);
         if (!self) return ask ? false : true;
-        if (!t->name || std::strcmp(t->name, "h_pre_norm") != 0) return ask ? false : true;
-        if (ask) return true;
-        if (!self->tap_h_pre_norm_file.is_open()) return true;
-        const size_t nbytes = ggml_nbytes(t);
-        const size_t elem_sz = ggml_element_size(t);
-        const size_t n_elem = nbytes / elem_sz;
-        std::vector<uint8_t> host(nbytes);
-        ggml_backend_tensor_get(t, host.data(), 0, nbytes);
-        std::vector<ggml_fp16_t> half(n_elem);
-        if (t->type == GGML_TYPE_F32) {
-            const float * f32 = (const float *) host.data();
-            for (size_t k = 0; k < n_elem; k++) half[k] = ggml_fp32_to_fp16(f32[k]);
-        } else if (t->type == GGML_TYPE_F16) {
-            std::memcpy(half.data(), host.data(), n_elem * sizeof(ggml_fp16_t));
-        } else if (t->type == GGML_TYPE_BF16) {
-            const uint16_t * bf = (const uint16_t *) host.data();
-            for (size_t k = 0; k < n_elem; k++) {
-                uint32_t u = ((uint32_t) bf[k]) << 16;
-                float f;
-                std::memcpy(&f, &u, sizeof(float));
-                half[k] = ggml_fp32_to_fp16(f);
-            }
-        } else {
+        if (!t->name) return ask ? false : true;
+
+        // h_pre_norm tap (original path)
+        if (std::strcmp(t->name, "h_pre_norm") == 0) {
+            if (ask) return true;
+            if (!self->tap_h_pre_norm_file.is_open()) return true;
+            const size_t nbytes = ggml_nbytes(t);
+            const size_t n_elem = nbytes / ggml_element_size(t);
+            std::vector<uint8_t> host(nbytes);
+            ggml_backend_tensor_get(t, host.data(), 0, nbytes);
+            std::vector<ggml_fp16_t> half(n_elem);
+            if (t->type == GGML_TYPE_F32) {
+                const float * f32 = (const float *) host.data();
+                for (size_t k = 0; k < n_elem; k++) half[k] = ggml_fp32_to_fp16(f32[k]);
+            } else if (t->type == GGML_TYPE_F16) {
+                std::memcpy(half.data(), host.data(), n_elem * sizeof(ggml_fp16_t));
+            } else if (t->type == GGML_TYPE_BF16) {
+                const uint16_t * bf = (const uint16_t *) host.data();
+                for (size_t k = 0; k < n_elem; k++) {
+                    uint32_t u = ((uint32_t) bf[k]) << 16;
+                    float f; std::memcpy(&f, &u, sizeof(float));
+                    half[k] = ggml_fp32_to_fp16(f);
+                }
+            } else { return true; }
+            self->tap_h_pre_norm_file.write((const char *) half.data(), n_elem * sizeof(ggml_fp16_t));
+            self->tap_h_pre_norm_file.flush();
             return true;
         }
-        self->tap_h_pre_norm_file.write((const char *) half.data(), n_elem * sizeof(ggml_fp16_t));
-        self->tap_h_pre_norm_file.flush();
-        return true;
+
+        // MTP-debug tap: match by tensor name against tap_mtp_files map.
+        // cb() names tensors as "<name>-<il>" for il>=0, or just "<name>" for il=-1.
+        // Strip the trailing "-<digits>" suffix to recover the base name for lookup.
+        if (!self->tap_mtp_files.empty()) {
+            std::string tname(t->name);
+            // strip trailing "-NNN" layer suffix if present
+            auto dash = tname.rfind('-');
+            std::string base_name = tname;
+            if (dash != std::string::npos) {
+                bool all_digits = true;
+                for (size_t i = dash + 1; i < tname.size(); ++i) {
+                    if (!std::isdigit((unsigned char)tname[i])) { all_digits = false; break; }
+                }
+                if (all_digits && dash + 1 < tname.size()) base_name = tname.substr(0, dash);
+            }
+            auto it = self->tap_mtp_files.find(base_name);
+            if (it != self->tap_mtp_files.end()) {
+                if (ask) return true;
+                auto & ofs = it->second;
+                if (!ofs.is_open()) return true;
+                // write 4-int32 shape header then f16 data
+                int32_t ne[4] = {(int32_t)t->ne[0], (int32_t)t->ne[1],
+                                 (int32_t)t->ne[2], (int32_t)t->ne[3]};
+                ofs.write((const char *) ne, sizeof(ne));
+                const size_t nbytes = ggml_nbytes(t);
+                const size_t n_elem = nbytes / ggml_element_size(t);
+                std::vector<uint8_t> host(nbytes);
+                ggml_backend_tensor_get(t, host.data(), 0, nbytes);
+                std::vector<ggml_fp16_t> half(n_elem);
+                if (t->type == GGML_TYPE_F32) {
+                    const float * f32 = (const float *) host.data();
+                    for (size_t k = 0; k < n_elem; k++) half[k] = ggml_fp32_to_fp16(f32[k]);
+                } else if (t->type == GGML_TYPE_F16) {
+                    std::memcpy(half.data(), host.data(), n_elem * sizeof(ggml_fp16_t));
+                } else if (t->type == GGML_TYPE_BF16) {
+                    const uint16_t * bf = (const uint16_t *) host.data();
+                    for (size_t k = 0; k < n_elem; k++) {
+                        uint32_t u = ((uint32_t) bf[k]) << 16;
+                        float f; std::memcpy(&f, &u, sizeof(float));
+                        half[k] = ggml_fp32_to_fp16(f);
+                    }
+                } else { return true; }
+                ofs.write((const char *) half.data(), n_elem * sizeof(ggml_fp16_t));
+                ofs.flush();
+                return true;
+            }
+        }
+
+        return ask ? false : true;
     }
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
@@ -1021,6 +1076,12 @@ private:
             cparams_mtp.n_ctx     = llama_n_ctx_seq(ctx);
             cparams_mtp.n_seq_max = 1; // each ctx_mtp is a single-seq context
             cparams_mtp.n_rs_seq  = 0;
+            // Forward MTP-debug eval callback so ctx_mtp graph tensors get tapped.
+            if (std::getenv("LLAMA_MTP_TAP")) {
+                cparams_mtp.cb_eval           = &server_context_impl::tap_h_pre_norm_eval_cb;
+                cparams_mtp.cb_eval_user_data = this;
+                SRV_INF("%s\n", "mtp-tap: cb_eval forwarded to ctx_mtp via cparams");
+            }
 
             params_base.speculative.mtp.model   = model_mtp.get();
             params_base.speculative.mtp.cparams = cparams_mtp;
@@ -1213,6 +1274,26 @@ private:
         // propagate new defaults back to caller
         params = params_base;
 
+        // MTP-debug tensor tap: unconditionally init from LLAMA_MTP_TAP env
+        // (does not require --tap-layers or --tap-out-dir with layer indices)
+        if (!params_base.tap_out_dir.empty()) {
+            if (const char * mtp_tap_env = std::getenv("LLAMA_MTP_TAP")) {
+                std::filesystem::create_directories(params_base.tap_out_dir);
+                std::istringstream mtp_ss(mtp_tap_env);
+                std::string mtp_name;
+                while (std::getline(mtp_ss, mtp_name, ',')) {
+                    if (mtp_name.empty()) continue;
+                    const std::string fp = params_base.tap_out_dir + "/mtp_" + mtp_name + ".bin";
+                    tap_mtp_files[mtp_name].open(fp, std::ios::binary | std::ios::app);
+                    if (!tap_mtp_files[mtp_name].is_open()) {
+                        SRV_ERR("mtp-tap: failed to open '%s'\n", fp.c_str());
+                    } else {
+                        SRV_INF("mtp-tap: capturing tensor '%s' -> %s\n", mtp_name.c_str(), fp.c_str());
+                    }
+                }
+            }
+        }
+
         // tap-layer hidden-state dump setup
         if (!params_base.tap_out_dir.empty() && !params_base.tap_layers_csv.empty()) {
             // parse CSV of layer indices
@@ -1271,6 +1352,22 @@ private:
                             } else {
                                 SRV_INF("tap: registering eval callback for h_pre_norm -> %s\n", fpath.c_str());
                                 llama_set_eval_callback(ctx, &server_context_impl::tap_h_pre_norm_eval_cb, this);
+                            }
+                        }
+                        // MTP-debug: env LLAMA_MTP_TAP=name1,name2,...
+                        if (const char * mtp_tap_env = std::getenv("LLAMA_MTP_TAP")) {
+                            std::filesystem::create_directories(params_base.tap_out_dir);
+                            std::istringstream ss(mtp_tap_env);
+                            std::string name;
+                            while (std::getline(ss, name, ',')) {
+                                if (name.empty()) continue;
+                                const std::string fp = params_base.tap_out_dir + "/mtp_" + name + ".bin";
+                                tap_mtp_files[name].open(fp, std::ios::binary | std::ios::app);
+                                if (!tap_mtp_files[name].is_open()) {
+                                    SRV_ERR("mtp-tap: failed to open '%s'\n", fp.c_str());
+                                } else {
+                                    SRV_INF("mtp-tap: capturing tensor '%s' -> %s\n", name.c_str(), fp.c_str());
+                                }
                             }
                         }
                     }
