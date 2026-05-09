@@ -830,9 +830,10 @@ struct common_speculative_state_mtp : public common_speculative_state {
                 return;
             }
 
-            // Phase D: run trunk verification.
-            // commit_to_slot=false: Phase C compatibility (caller re-decodes accepted tokens).
-            // commit_to_slot=true would be Phase D.1 (direct commit) — deferred to Phase E.
+            // Phase E.1 stub: run trunk verification.
+            // commit_to_slot=false: Phase C/D compatibility (caller re-decodes accepted tokens).
+            // Full E.1 skip-redecode (commit_to_slot=true + server bypass) is deferred —
+            // it requires deep server accept-loop changes beyond Phase E scope.
             const llama_seq_id slot_seq  = (llama_seq_id)seq_id;
             const llama_seq_id base_seq  = (llama_seq_id)(seq_id + 1);
             const uint32_t     n_seq_max = llama_n_seq_max(ctx_tgt);
@@ -856,13 +857,13 @@ struct common_speculative_state_mtp : public common_speculative_state {
                 tree_correction   = -1;
             } else {
                 // accepted = [acc_tok_0, ..., acc_tok_{n_acc-1}]
-                // correction = trunk_tok at position n_past+n_acc (Phase C compat)
-                //
-                // Return only accepted tokens; caller re-verifies via normal trunk decode.
+                // correction = trunk_tok at position n_past+n_acc
+                // Return accepted tokens; caller re-verifies via normal trunk decode.
                 draft_tokens.assign(accepted.begin(), accepted.end());
-                tree_n_committed = -1; // Phase D.1 not active
+                tree_n_committed = -1; // E.1 not active (Phase C compat)
                 tree_correction  = correction;
-                LOG_INF("%s: [tree D] accepted=%d correction=%d (per-leaf-kv: D.2 active)\n",
+                LOG_INF("%s: [tree E] accepted=%d correction=%d "
+                        "(per-leaf-kv: D.2 active, pruning: E.2 active)\n",
                         __func__, n_acc, (int)correction);
             }
 

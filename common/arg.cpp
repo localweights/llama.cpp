@@ -3612,6 +3612,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TREE_MAX_DEPTH"));
     add_opt(common_arg(
+        {"--spec-tree-max-nodes"}, "N",
+        string_format("EAGLE-2 tree drafting: total node budget across all depths (default: %d)", params.speculative.mtp.tree_max_nodes),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("spec-tree-max-nodes must be >= 1");
+            }
+            params.speculative.mtp.tree_max_nodes = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TREE_MAX_NODES"));
+    add_opt(common_arg(
+        {"--spec-tree-p-min"}, "FLOAT",
+        string_format("EAGLE-2 tree drafting: cumulative log-prob floor for branch pruning (default: %.2f, 0.0 = disabled)", (double)params.speculative.mtp.tree_p_min),
+        [](common_params & params, const std::string & value) {
+            params.speculative.mtp.tree_p_min = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TREE_P_MIN"));
+    add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),
         [](common_params & params, int value) {

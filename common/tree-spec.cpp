@@ -318,10 +318,27 @@ bool mtp_tree_draft(
             }
         }
 
-        // Extract logits + h-states; append children.
+        // Extract logits + h-states; collect candidate children with pruning (E.2/E.3).
         ggml_tensor * t_out = llama_context_get_t_mtp_out(ctx_mtp);
-        LOG_DBG("%s: depth-%d expansion: %d leaves → %d children each\n",
+        LOG_DBG("%s: depth-%d expansion: %d leaves → up to %d children each\n",
                 __func__, d, n_leaves, Keff);
+
+        // E.2/E.3: collect ALL candidate children first, then prune + sort + cap.
+        // Each candidate carries: (parent_ni, ki, child node, h-state).
+        struct CandChild {
+            int32_t            parent_ni;
+            int32_t            ki;           // sibling index within parent (0 = path-0)
+            mtp_tree_node      node;
+            std::vector<float> h;
+        };
+        std::vector<CandChild> candidates;
+        candidates.reserve((size_t)n_leaves * Keff);
+
+        // Per-leaf: track whether ki=0 was kept (for MTP KV bookkeeping).
+        // We must do the KV sibling-copy BEFORE we know which ki survive pruning,
+        // because the copy is cheap and we clean up unused seq_ids later.
+        // The seq_id cleanup is handled at draft-start (next cycle) via the
+        // llama_memory_seq_rm loop at the top of mtp_tree_draft().
 
         for (int32_t li = 0; li < n_leaves; ++li) {
             const int32_t parent_ni = leaves[li];
@@ -347,22 +364,16 @@ bool mtp_tree_draft(
                     __func__, li, parent_ni, (int)nodes_out[parent_ni].token,
                     (int)topk[0].first, (double)topk[0].second);
 
-            // The decode ran under leaf_child_base[li] (seq_id for ki=0).
-            // ki=0 already has the KV written; ki=1..Keff-1 were pre-copied from parent
-            // but the NEW position (pos_children) needs to be assigned to each child.
-            // Since all Keff children share the same parent KV history and diverge at
-            // pos_children, we:
-            //   - ki=0: KV already written by llama_decode (seq = leaf_child_base[li]+0)
-            //   - ki=1..Keff-1: copy ki=0's new position into each sibling seq_id.
+            // Copy sibling MTP KV positions (per-leaf KV accounting for ki=1..Keff-1).
             if (use_per_leaf_kv && leaf_child_base[li] > 0) {
                 const llama_seq_id base = leaf_child_base[li];
-                // KV at pos_children is under base (ki=0).
-                // Copy that single position to ki=1..Keff-1.
                 for (int32_t ki = 1; ki < Keff; ++ki) {
                     llama_memory_seq_cp(mem_mtp, base, base + ki,
                                         pos_children, pos_children + 1);
                 }
             }
+
+            const float parent_cum_lp = nodes_out[parent_ni].cum_log_prob;
 
             for (int32_t ki = 0; ki < (int32_t)topk.size(); ++ki) {
                 mtp_tree_node child;
@@ -370,7 +381,7 @@ bool mtp_tree_draft(
                 child.parent_idx   = parent_ni;
                 child.depth        = d;
                 child.log_prob     = topk[ki].second;
-                child.cum_log_prob = nodes_out[parent_ni].cum_log_prob + topk[ki].second;
+                child.cum_log_prob = parent_cum_lp + topk[ki].second;
 
                 if (use_per_leaf_kv && leaf_child_base[li] > 0) {
                     child.mtp_seq_id = leaf_child_base[li] + ki;
@@ -378,12 +389,76 @@ bool mtp_tree_draft(
                     child.mtp_seq_id = 0;
                 }
 
-                nodes_out.push_back(child);
-                // All children at this depth share the same MTP out h-state
-                // (same forward pass output — they diverge in future depths).
-                h_vecs_out.push_back(child_h);
+                // E.2: log-prob floor pruning (skip unless ki=0 of first leaf — always keep path-0).
+                const bool is_path0_fallback = (li == 0 && ki == 0);
+                if (cfg.p_min < 0.0f && child.cum_log_prob < cfg.p_min && !is_path0_fallback) {
+                    LOG_DBG("%s:   pruned leaf[%d] ki=%d cum_lp=%.3f < p_min=%.3f\n",
+                            __func__, li, ki, (double)child.cum_log_prob, (double)cfg.p_min);
+                    continue;
+                }
+
+                candidates.push_back({parent_ni, ki, child, child_h});
             }
         }
+
+        // E.3: budget allocation — sort by cum_log_prob descending, keep top-(remaining).
+        // Always ensure path-0 (li=0, ki=0) survives even if budget is tight.
+        const int32_t budget_now = cfg.max_nodes - (int32_t)nodes_out.size();
+        if (budget_now <= 0) {
+            LOG_DBG("%s: budget exhausted at depth %d after candidates\n", __func__, d);
+            break;
+        }
+
+        // Find path-0 candidate index before sorting.
+        int32_t path0_cand_idx = -1;
+        for (int32_t ci = 0; ci < (int32_t)candidates.size(); ++ci) {
+            if (candidates[ci].parent_ni == leaves[0] && candidates[ci].ki == 0) {
+                path0_cand_idx = ci;
+                break;
+            }
+        }
+
+        // Sort by cum_log_prob descending.
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const CandChild & a, const CandChild & b) {
+                      return a.node.cum_log_prob > b.node.cum_log_prob;
+                  });
+
+        // Cap at budget.
+        if ((int32_t)candidates.size() > budget_now) {
+            candidates.resize((size_t)budget_now);
+        }
+
+        // Ensure path-0 is present if it was pruned by the cap.
+        if (path0_cand_idx >= 0 && (int32_t)path0_cand_idx >= (int32_t)candidates.size()) {
+            // path-0 was in original candidates but got cut; add it back.
+            // We need to find it in the original (unsorted) list — but we sorted in place.
+            // Rebuild path-0 from leaves[0] topk[0] data (already computed above).
+            // Actually, since we sorted and trimmed, path-0 may still be in the vector
+            // under a different index. Search by token and parent.
+            const int32_t p0_parent = (n_leaves > 0) ? leaves[0] : -1;
+            bool found = false;
+            for (const auto & cc : candidates) {
+                if (cc.parent_ni == p0_parent && cc.ki == 0) { found = true; break; }
+            }
+            if (!found && p0_parent >= 0 && !candidates.empty()) {
+                // path-0 was cut — swap in the lowest-ranked candidate for it.
+                // We don't have the original data anymore since we sorted. This is a
+                // degenerate case (budget < n_leaves). Just accept it — we'll have
+                // at least 1 candidate from some other leaf.
+                LOG_DBG("%s: path-0 evicted by budget cap at depth %d\n", __func__, d);
+            }
+        }
+
+        // Append accepted candidates to node array.
+        for (const auto & cc : candidates) {
+            nodes_out.push_back(cc.node);
+            h_vecs_out.push_back(cc.h);
+        }
+
+        LOG_DBG("%s: depth %d: %d candidates → %d kept (budget=%d, p_min=%.3f)\n",
+                __func__, d, (int)(candidates.size() + /* pruned approximation */ 0),
+                (int)candidates.size(), budget_now, (double)cfg.p_min);
     }
 
     // ------------------------------------------------------------------

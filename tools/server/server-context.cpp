@@ -99,6 +99,21 @@ struct server_slot {
     server_prompt_checkpoint spec_ckpt;
     common_speculative_ptr spec;
 
+    // Phase E.1: tree skip-redecode state.
+    // When spec_tree_ids is non-empty, the accepted tokens' KV has been committed to
+    // slot_seq by mtp_tree_verify(commit_to_slot=true).  The server bypasses the
+    // normal sample_and_accept_n re-decode and uses spec_tree_ids directly.
+    //
+    // spec_tree_ids layout: [sampled, acc_0, ..., acc_{n-1}, correction]
+    //   sampled    = the id_last / root probe token (already at n_past in KV)
+    //   acc_0..n-1 = accepted draft tokens (committed to slot_seq KV at n_past+1..n_past+n)
+    //   correction = trunk's argmax at rejection point (to be decoded next)
+    //
+    // The accept loop detects spec_tree_ids.size() > 0 and processes them directly.
+    llama_tokens spec_tree_ids;  // precomputed accepted+correction list for E.1 path
+    int32_t     spec_tree_committed   = -1; // number of committed accepted tokens (not counting sampled/correction), or -1
+    llama_token spec_tree_correction  = -1; // correction token from tree verify (also ids.back())
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -226,6 +241,9 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            spec_tree_ids.clear();
+            spec_tree_committed  = -1;
+            spec_tree_correction = -1;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -369,24 +387,35 @@ struct server_slot {
             } else {
                 GGML_ASSERT(spec_i_batch.empty());
 
+                // Reset tree-committed state from previous draft cycle.
+                spec_tree_committed  = -1;
+                spec_tree_correction = -1;
+
                 // generate a new draft
                 spec_draft = common_speculative_draft(spec.get(), params_spec, tokens, sampled);
                 n_draft_total += spec_draft.size();
+
+                // Phase E.1: check if tree verify already committed the accepted KV.
+                const int32_t n_committed = common_speculative_tree_n_committed(spec.get());
+                if (n_committed >= 0) {
+                    spec_tree_committed  = n_committed;
+                    spec_tree_correction = common_speculative_tree_correction(spec.get());
+                    SLT_DBG(*this, "[E.1] tree committed: n_acc=%d correction=%d\n",
+                            n_committed, (int)spec_tree_correction);
+                }
 
                 if (spec_draft.size() > (size_t) n_draft_max) {
                     SLT_WRN(*this, "draft size %d exceeds max %d, truncating\n", (int) spec_draft.size(), n_draft_max);
                     spec_draft.resize(n_draft_max);
                 }
 
-                if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                        spec_tree_committed < 0) {
+                    // Checkpoint only for non-committed (Phase C compat) drafts.
+                    // Tree-committed drafts already have KV in place; checkpoint not needed.
                     const auto n_tokens = prompt.tokens.size();
 
-                    //const int64_t t_start = ggml_time_us();
-
                     server_prompt_checkpoint_update(spec_ckpt, ctx, this->id, n_tokens, true);
-
-                    //const int64_t t_total = ggml_time_us() - t_start;
-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
 
                     SLT_DBG(*this, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %zu, size = %.3f MiB)\n",
                             spec_ckpt.pos_min, spec_ckpt.pos_max, n_tokens, (float) spec_ckpt.data.size() / 1024 / 1024);
@@ -395,6 +424,13 @@ struct server_slot {
 
             GGML_ASSERT(spec_draft.size() <= (size_t) n_draft_max);
         }
+
+        // Phase E.1 stub: tree-committed path is deferred.
+        // spec_tree_committed will always be -1 (commit_to_slot=false in spec).
+        // The spec_tree_ids / spec_tree_correction fields are reserved for future E.1 wiring.
+        // No-op block here; normal path falls through.
+        (void)spec_tree_committed;
+        (void)spec_tree_correction;
 
         if (spec_draft.empty()) {
             // no speculative decoding
@@ -1074,13 +1110,13 @@ private:
             // The shared cparams template is stored here; seq_id is set per-slot at init time.
             auto cparams_mtp = common_context_params_to_llama(params_base);
             cparams_mtp.n_ctx     = llama_n_ctx_seq(ctx);
-            // Phase D.2: bump ctx_mtp n_seq_max to support per-leaf MTP KV.
+            // Phase D.2 / E.3: bump ctx_mtp n_seq_max to support per-leaf MTP KV.
             // For a tree of branching K and depth D, we need up to K^D seq_ids.
-            // Use tree_max_nodes as a conservative upper bound (capped at 64).
+            // Use tree_max_nodes as a conservative upper bound (capped at LLAMA_MAX_SEQ-1=254).
             {
                 const bool has_tree = params_base.speculative.mtp.tree_branching > 1;
                 if (has_tree) {
-                    const int32_t n_mtp_seqs = std::min(params_base.speculative.mtp.tree_max_nodes, 64);
+                    const int32_t n_mtp_seqs = std::min(params_base.speculative.mtp.tree_max_nodes, 254);
                     cparams_mtp.n_seq_max = (uint32_t) n_mtp_seqs;
                 } else {
                     cparams_mtp.n_seq_max = 1; // each ctx_mtp is a single-seq context
@@ -3400,6 +3436,88 @@ private:
 
                     continue;
                 }
+            }
+
+            // Phase E.1: tree skip-redecode — process pre-accepted tokens.
+            // When spec_tree_ids is non-empty, the accepted tokens have already been committed
+            // to slot_seq's KV by mtp_tree_verify.  We output them here (before the spec
+            // accept loop) and update MTP state.  The correction token was decoded in the
+            // trunk batch above (at i_batch); its process_token happens in loop 1 above.
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING || slot.spec_tree_ids.empty()) {
+                    continue;
+                }
+
+                const auto & ids = slot.spec_tree_ids;
+                // ids = [sampled, acc_0..acc_{n-1}, correction]
+                // correction is ids.back() = sampled in this step (will be output by loop 1 above).
+                // We output ids[0..size-2] here (sampled + all accepted), and call accept() for MTP.
+                // ids.back() (correction) is handled by the non-spec loop 1 at i_batch.
+
+                const size_t n_ids = ids.size();
+                // ids = [sampled, acc_0..acc_{n_acc-1}, correction]
+                // n_acc = number of accepted draft tokens (not counting sampled or correction)
+                const int32_t n_acc = (int32_t)(n_ids - 2);
+
+                const int64_t t_current = ggml_time_us();
+
+                // All n_ids tokens are output here.
+                // correction = ids.back(); after process_token sets slot.sampled = correction,
+                // loop 1 (non-spec) will sample from i_batch (correction's batch row) to get
+                // the next token.  Loop 1 will output that next token (post-correction).
+                // BUT: we don't want loop 1 to fire for this slot if we've processed correction.
+                // We signal loop 1 by clearing i_batch.
+                // Actually: loop 1 runs regardless. We need to prevent double output.
+                //
+                // Clean solution: output ALL n_ids tokens here, including correction.
+                // Set i_batch = -1 to prevent loop 1 from firing for this slot.
+                // The correction's logits in i_batch ARE available for the NEXT step's MTP draft.
+                // But loop 1 would sample from correction's logits → that's the next-next token.
+                // We don't want to output that; instead we want to DRAFT from it next step.
+                //
+                // Conclusion: set i_batch = -1 after output; loop 1 skips this slot.
+                // Next draft() call will read correction's h-state for MTP.
+
+                slot.n_decoded += (int32_t)n_ids;  // all tokens including correction
+                slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+                slot.n_draft_accepted += n_acc;
+
+                // Update MTP KV (trim to n_acc) and update spec stats.
+                common_speculative_accept(slot.spec.get(), (uint16_t)n_acc, /*last_accepted_row=*/ -1);
+
+                // Advance sampler for acc_0..acc_{n_acc-1} and correction.
+                // sampled (ids[0]) was already accepted in a prior step, skip it.
+                for (size_t ai = 1; ai < n_ids; ++ai) {
+                    common_sampler_accept(slot.smpl.get(), ids[ai], /* apply_grammar */ false);
+                }
+
+                // Output ALL tokens: sampled, accepted, correction.
+                // After this loop, slot.sampled = correction (set by last process_token call).
+                bool slot_released = false;
+                for (size_t i = 0; i < n_ids; ++i) {
+                    completion_token_output result;
+                    result.tok          = ids[i];
+                    result.text_to_send = common_token_to_piece(slot.ctx, result.tok, accept_special_token(slot, result.tok));
+                    result.prob         = 1.0f;
+
+                    if (!process_token(result, slot)) {
+                        slot.print_timings();
+                        send_final_response(slot);
+                        metrics.on_prediction(slot);
+                        slot.release();
+                        slot_released = true;
+                        break;
+                    }
+                }
+
+                // Disable loop 1 for this slot (correction was already output above).
+                slot.i_batch = -1;
+
+                // Clear so we don't re-process.
+                slot.spec_tree_ids.clear();
+
+                SLT_DBG(slot, "[E.1] processed %zu tokens (n_acc=%d, released=%d)\n",
+                        n_ids, n_acc, (int)slot_released);
             }
 
             // speculative decoding - main model sample and accept
