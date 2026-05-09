@@ -670,12 +670,12 @@ struct common_speculative_state_mtp : public common_speculative_state {
         batch.seq_id[0][0] = 0; // ctx_mtp internal seq; always 0
         batch.logits[0]    = 1;
 
-        // Trunk verification batch (Phase C): capacity = 2*TREE_SPEC_MAX_BATCH + 1
-        // (1 root probe slot_seq + up to TREE_SPEC_MAX_BATCH path root probes +
-        // up to TREE_SPEC_MAX_BATCH tree nodes).
-        // n_seq_max=1 here because each token specifies its own seq_id explicitly.
-        tgt_batch = llama_batch_init(/*n_tokens=*/ 2 * TREE_SPEC_MAX_BATCH + 1,
-                                     /*embd=*/ 0, /*n_seq_max=*/ 1);
+        // Trunk verification batch (Phase E.1): capacity = TREE_SPEC_MAX_BATCH + 1
+        // (1 root probe under slot_seq + up to TREE_SPEC_MAX_BATCH tree nodes).
+        // n_seq_max=2: each tree node lists [node_seq, slot_seq] so it attends to
+        // both its own KV and the prompt (no per-path seq_cp needed).
+        tgt_batch = llama_batch_init(/*n_tokens=*/ TREE_SPEC_MAX_BATCH + 1,
+                                     /*embd=*/ 0, /*n_seq_max=*/ 2);
 
         llama_set_mtp(ctx_tgt, seq_id, ctx_mtp);
     }
@@ -830,10 +830,11 @@ struct common_speculative_state_mtp : public common_speculative_state {
                 return;
             }
 
-            // Phase E.1 stub: run trunk verification.
-            // commit_to_slot=false: Phase C/D compatibility (caller re-decodes accepted tokens).
-            // Full E.1 skip-redecode (commit_to_slot=true + server bypass) is deferred —
-            // it requires deep server accept-loop changes beyond Phase E scope.
+            // Phase E.1: run trunk verification with direct KV commit.
+            // commit_to_slot=true: accepted path KV is committed to slot_seq by
+            // mtp_tree_verify via llama_memory_seq_cp.  The server only needs to
+            // decode the correction token (1 token) instead of the full accepted
+            // prefix, eliminating the double-decode cost.
             const llama_seq_id slot_seq  = (llama_seq_id)seq_id;
             const llama_seq_id base_seq  = (llama_seq_id)(seq_id + 1);
             const uint32_t     n_seq_max = llama_n_seq_max(ctx_tgt);
@@ -844,7 +845,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
                 ctx_tgt, tgt_batch, tree_nodes,
                 tree_n_past, tree_id_last,
                 slot_seq, base_seq, n_seq_max,
-                /*commit_to_slot=*/ false,
+                /*commit_to_slot=*/ true,
                 accepted, correction);
 
             if (accepted.empty() && correction < 0) {
@@ -856,18 +857,95 @@ struct common_speculative_state_mtp : public common_speculative_state {
                 tree_n_committed  = -1;
                 tree_correction   = -1;
             } else {
-                // accepted = [acc_tok_0, ..., acc_tok_{n_acc-1}]
-                // correction = trunk_tok at position n_past+n_acc
-                // Return accepted tokens; caller re-verifies via normal trunk decode.
+                // Phase E.1: KV for positions [n_past .. n_past+n_acc] is now in slot_seq
+                // when n_acc > 0 (D.1 commit fires only for n_accepted > 0).
+                // draft_tokens = accepted tokens.
                 draft_tokens.assign(accepted.begin(), accepted.end());
-                tree_n_committed = -1; // E.1 not active (Phase C compat)
-                tree_correction  = correction;
-                LOG_INF("%s: [tree E] accepted=%d correction=%d "
-                        "(per-leaf-kv: D.2 active, pruning: E.2 active)\n",
-                        __func__, n_acc, (int)correction);
+                tree_correction = correction;
+                if (n_acc > 0) {
+                    // D.1 committed; server skips re-decode of accepted tokens.
+                    tree_n_committed = n_acc;
+                    LOG_INF("%s: [tree E.1] accepted=%d correction=%d "
+                            "(commit_to_slot=true, KV committed to slot_seq=%d)\n",
+                            __func__, n_acc, (int)correction, (int)slot_seq);
+
+                    // E.1 ctx_mtp sync.
+                    //
+                    // Problem: ctx_mtp seq 0 only has root forward at pos (pos_start).
+                    // After E.1 commit, handle_mtp fires for correction at pos+n_acc+1,
+                    // but ctx_mtp max=pos (gap of n_acc). pending_pos is stale from the
+                    // last pre-draft decode. Result: pending_continues=false → n_out=0
+                    // → ctx_mtp NOT updated for correction → ctx_mtp stuck at pos.
+                    //
+                    // Fix:
+                    // 1. Copy accepted nodes' MTP KV (pos+1..pos+n_acc) from their
+                    //    per-leaf mtp_seq_id to ctx_mtp seq 0.
+                    // 2. Call llama_context_mtp_set_pending(ctx_tgt, slot_seq, pos+n_acc,
+                    //    h_vec_of_last_accepted) to advance the hook's pending_pos so
+                    //    handle_mtp sees consecutive positions at correction pos+n_acc+1.
+                    //
+                    // h_vec: ctx_mtp output h-state of the last accepted node (from h_vecs).
+                    // This is an approximation of ctx_tgt's pre-norm h-state at that pos,
+                    // but close enough for the draft model (slightly lower accept rate
+                    // at most, which is acceptable for a correction token).
+                    {
+                        llama_memory_t mem_mtp = llama_get_memory(ctx_mtp);
+                        int32_t  cur_ni = 0; // root sentinel
+                        int32_t  last_ni = 0;
+                        bool     mtp_sync_ok = true;
+                        for (int32_t d = 0; d < n_acc; ++d) {
+                            bool found = false;
+                            for (int32_t ci : tree_nodes[cur_ni].children) {
+                                if (tree_nodes[ci].verified) {
+                                    const llama_seq_id msid = (llama_seq_id)tree_nodes[ci].mtp_seq_id;
+                                    const llama_pos    mpos = pos + 1 + d;
+                                    llama_memory_seq_cp(mem_mtp, msid, 0, mpos, mpos + 1);
+                                    LOG_DBG("%s: [E.1 mtp-sync] depth=%d mtp_seq=%d pos=%d → seq0\n",
+                                            __func__, d, (int)msid, (int)mpos);
+                                    last_ni = ci;
+                                    cur_ni  = ci;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                LOG_WRN("%s: [E.1 mtp-sync] no verified node at depth=%d\n",
+                                        __func__, d);
+                                mtp_sync_ok = false;
+                                break;
+                            }
+                        }
+                        if (mtp_sync_ok) {
+                            // Advance hook pending_pos to pos+n_acc so correction at
+                            // pos+n_acc+1 will fire pending_continues=true in handle_mtp.
+                            // h_vec = ctx_mtp output h-state of last accepted node.
+                            const float * h_pending = (last_ni > 0 && last_ni < (int32_t)h_vecs.size())
+                                ? h_vecs[last_ni].data() : nullptr;
+                            llama_context_mtp_set_pending(ctx_tgt, (llama_seq_id)seq_id,
+                                                          pos + n_acc,
+                                                          h_pending, n_embd);
+                            LOG_INF("%s: [tree E.1] ctx_mtp seq0 synced to pos %d, pending=%d\n",
+                                    __func__, (int)(pos + n_acc), (int)(pos + n_acc));
+                        }
+                    }
+                } else {
+                    // n_acc==0: D.1 commit did not fire; fall through to normal path in server.
+                    tree_n_committed = -1;
+                    LOG_INF("%s: [tree E.1] accepted=0 correction=%d "
+                            "(no commit; server uses normal path)\n",
+                            __func__, (int)correction);
+                }
             }
 
-            last_n_drafted = (uint16_t) draft_tokens.size();
+            // Tree MTP: ctx_mtp seq 0 has exactly 1 new position (root forward at
+            // pos_start).  Per-leaf seq_ids (1..N) hold deeper positions and are
+            // cleaned by the seq_rm loop at the start of mtp_tree_draft().
+            // accept() computes: n_to_drop = last_n_drafted - 1.
+            // With last_n_drafted=1 → n_to_drop=0 → pos_start kept (correct:
+            // pos_start = id_last which is always in the committed context).
+            last_n_drafted = 1;
+            LOG_INF("%s: [tree E.1] last_n_drafted=1 (root-only MTP seq0, n_acc=%d)\n",
+                    __func__, n_acc);
             return;
         }
 

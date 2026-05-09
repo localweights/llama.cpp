@@ -1005,6 +1005,16 @@ extern "C" {
             llama_seq_id           seq_id,
             struct llama_context * ctx_mtp);
 
+    // E.1: after tree-verify commits accepted positions, advance the MTP hook's
+    // pending_pos so the next correction decode fires handle_mtp correctly.
+    // h_vec: h-state of the last accepted position (n_embd floats), or NULL.
+    LLAMA_API void llama_context_mtp_set_pending(
+            struct llama_context * ctx_target,
+            llama_seq_id           seq_id,
+            llama_pos              new_pending_pos,
+            const float          * h_vec,
+            int32_t                n_embd);
+
     // [EXPERIMENTAL] Tap-layer dump: open per-layer f16 files in `dir` and write manifest.json.
     // Call once after model init. layers[n_layers] are 0-based layer indices; n_embd is model embedding dim.
     // n_seq_max > 1: creates per-seq files h_l<L>.s<S>.bin (supports --parallel N capture).

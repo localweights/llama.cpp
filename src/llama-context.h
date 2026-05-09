@@ -106,10 +106,29 @@ struct llama_context {
     }
 
     void set_mtp(llama_seq_id seq_id, llama_context * ctx_mtp_in);
+    // E.1: advance the hook's pending_pos to new_pending_pos with given h-state.
+    void mtp_set_pending(llama_seq_id seq_id, llama_pos new_pending_pos,
+                         const float * h_vec, int32_t n_embd_in);
     // Returns the ctx_mtp registered for seq_id, or nullptr if none.
     llama_context * get_mtp(llama_seq_id seq_id) const {
         auto it = mtp_map.find(seq_id);
         return (it != mtp_map.end()) ? it->second.ctx_mtp : nullptr;
+    }
+
+    // Phase E.1 slot-reuse fix: clear prefill-hook pending state for seq_id
+    // when its KV is trimmed at trim_from. If pending_pos >= trim_from the
+    // stashed h-state is stale and must not be used to chain into the next
+    // ubatch (would create a ctx_mtp KV gap → llama_decode rc=-1).
+    void mtp_invalidate_pending(llama_seq_id seq_id, llama_pos trim_from) {
+        auto it = mtp_map.find(seq_id);
+        if (it == mtp_map.end()) return;
+        auto & slot = it->second;
+        if (slot.pending_pos < 0 || slot.pending_pos >= trim_from) {
+            slot.pending_pos = -1;
+            if (!slot.pending_h.empty()) {
+                std::fill(slot.pending_h.begin(), slot.pending_h.end(), 0.0f);
+            }
+        }
     }
 
     llama_token * get_sampled_tokens() const;

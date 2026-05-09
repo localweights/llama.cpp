@@ -3633,6 +3633,15 @@ void llama_set_mtp(struct llama_context * ctx_target, llama_seq_id seq_id, struc
     ctx_target->set_mtp(seq_id, ctx_mtp);
 }
 
+void llama_context_mtp_set_pending(struct llama_context * ctx_target,
+                                    llama_seq_id seq_id,
+                                    llama_pos new_pending_pos,
+                                    const float * h_vec,
+                                    int32_t n_embd) {
+    if (!ctx_target) return;
+    ctx_target->mtp_set_pending(seq_id, new_pending_pos, h_vec, n_embd);
+}
+
 void llama_init_tap_layers(struct llama_context * ctx, const char * dir, const int * layers,
                            int n_layers, int n_embd, int n_seq_max, bool merge_on_close) {
     if (!ctx || !dir || !layers || n_layers <= 0) return;
@@ -3676,6 +3685,23 @@ void llama_context::set_mtp(llama_seq_id seq_id, llama_context * ctx_mtp_in) {
     slot.pending_h.assign(n_embd, 0.0f);
     LLAMA_LOG_INFO("%s: MTP draft head registered (seq_id=%d, ctx_mtp=%p, n_ubatch=%d, n_embd=%d)\n",
                    __func__, (int)seq_id, (const void *) slot.ctx_mtp, n_ub, n_embd);
+}
+
+// E.1: after tree-verify commits accepted positions to the trunk KV, the MTP
+// hook's pending_pos is stale (set from the last normal decode before the draft).
+// call this to advance it to `new_pending_pos` with a given h-state vector,
+// so the next handle_mtp_for_ubatch call sees consecutive positions.
+void llama_context::mtp_set_pending(llama_seq_id seq_id, llama_pos new_pending_pos,
+                                     const float * h_vec, int32_t n_embd_in) {
+    auto it = mtp_map.find(seq_id);
+    if (it == mtp_map.end()) return;
+    auto & slot = it->second;
+    slot.pending_pos = new_pending_pos;
+    if (h_vec && n_embd_in > 0) {
+        const int32_t n_embd_slot = (int32_t) slot.pending_h.size();
+        const int32_t n_copy = std::min(n_embd_in, n_embd_slot);
+        std::memcpy(slot.pending_h.data(), h_vec, (size_t) n_copy * sizeof(float));
+    }
 }
 
 // Helper: process MTP hook for a single seq_id's tokens within the ubatch.
@@ -4000,6 +4026,28 @@ bool llama_context_seq_rm(
     // Propagate seq_rm to the MTP slot for this seq_id (if registered).
     if (llama_context * ctx_mtp = ctx->get_mtp(seq_id)) {
         llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, p0, p1);
+
+        // Phase E.1 cross-request fix: also wipe ctx_mtp path-scratch seqs
+        // (sid 1..n_seq_max-1). These hold deeper KV from prior tree-draft
+        // cycles (possibly from a different request entirely) and survive
+        // beyond the slot trim, breaking the consecutive-position invariant
+        // when the slot is reused — even after the in-mtp_tree_draft wipe at
+        // the next draft cycle, since stale path-seq positions BELOW pos_start
+        // are not cleared by the existing seq_rm(sid, pos_start, -1) loop.
+        const uint32_t n_seq_max_mtp = llama_n_seq_max(ctx_mtp);
+        for (llama_seq_id sid = 1; sid < (llama_seq_id) n_seq_max_mtp; ++sid) {
+            llama_memory_seq_rm(llama_get_memory(ctx_mtp), sid, 0, -1);
+        }
+
+        // Phase E.1 slot-reuse fix: reset prefill-hook pending state when
+        // the trim invalidates the position pending_h refers to. pending_pos
+        // is the absolute position of the last h-row stashed by the hook.
+        // If we trim at p0 <= pending_pos, the stashed h-state is now stale
+        // (the trunk KV at that position no longer exists). Without this
+        // reset the next prefill at pos=p0 sees pending_pos far ahead, gets
+        // pending_continues=false, and the hook drops the first ubatch row
+        // → ctx_mtp KV gap → llama_decode rc=-1 → HTTP 500.
+        ctx->mtp_invalidate_pending(seq_id, (p0 < 0) ? 0 : p0);
     }
     return ok;
 }

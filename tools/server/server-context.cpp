@@ -405,8 +405,12 @@ struct server_slot {
                 }
 
                 if (spec_draft.size() > (size_t) n_draft_max) {
-                    SLT_WRN(*this, "draft size %d exceeds max %d, truncating\n", (int) spec_draft.size(), n_draft_max);
-                    spec_draft.resize(n_draft_max);
+                    // E.1: do NOT truncate when tree verify already committed the accepted KV.
+                    // spec_draft holds the accepted tokens; truncating would desync pos_correction.
+                    if (spec_tree_committed < 0) {
+                        SLT_WRN(*this, "draft size %d exceeds max %d, truncating\n", (int) spec_draft.size(), n_draft_max);
+                        spec_draft.resize(n_draft_max);
+                    }
                 }
 
                 if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
@@ -422,17 +426,71 @@ struct server_slot {
                 }
             }
 
-            GGML_ASSERT(spec_draft.size() <= (size_t) n_draft_max);
+            // E.1: spec_draft may hold n_acc > n_draft_max accepted tokens (not truncated above).
+            GGML_ASSERT(spec_tree_committed >= 0 || spec_draft.size() <= (size_t) n_draft_max);
         }
 
-        // Phase E.1 stub: tree-committed path is deferred.
-        // spec_tree_committed will always be -1 (commit_to_slot=false in spec).
-        // The spec_tree_ids / spec_tree_correction fields are reserved for future E.1 wiring.
-        // No-op block here; normal path falls through.
-        (void)spec_tree_committed;
-        (void)spec_tree_correction;
+        // Phase E.1: tree skip-redecode.
+        // When spec_tree_committed >= 0, mtp_tree_verify already committed the
+        // accepted path's KV to slot_seq.  We only need to decode the correction
+        // token (1 token at n_past+n_acc+1) rather than the full accepted prefix.
+        //
+        // spec_draft contains the accepted tokens (length = n_committed).
+        // spec_tree_correction is the correction token.
+        //
+        // Batch layout for E.1:
+        //   [correction] at pos = prompt.tokens.pos_next() + n_committed
+        //   (positions 0..n_committed are already in KV from the commit)
+        //
+        // spec_tree_ids = [sampled, acc_0..acc_{n-1}, correction]
+        // is populated here so the E.1 output loop (below) can emit all tokens.
+        if (spec_tree_committed >= 0 && !spec_draft.empty()) {
+            // Build spec_tree_ids: sampled + accepted + correction
+            spec_tree_ids.clear();
+            spec_tree_ids.push_back(sampled);
+            spec_tree_ids.insert(spec_tree_ids.end(), spec_draft.begin(), spec_draft.end());
+            if (spec_tree_correction >= 0) {
+                spec_tree_ids.push_back(spec_tree_correction);
+            } else {
+                // No valid correction — treat as no E.1 active; fall through to normal path.
+                spec_tree_ids.clear();
+                spec_tree_committed = -1;
+            }
+        }
 
-        if (spec_draft.empty()) {
+        if (spec_tree_committed >= 0 && !spec_tree_ids.empty()) {
+            // E.1 active: only decode correction token.
+            // Positions [0..n_past+n_committed] are already in slot_seq KV.
+            // The correction token goes at pos = prompt.tokens.pos_next() + spec_draft.size()
+            // = n_past + n_committed + 1 (since pos_next = n_past + 1 after sampled is counted).
+            // Wait — prompt.tokens.pos_next() currently points to where sampled would go.
+            // sampled is pos_next; acc_0 = pos_next+1; ...; acc_{n-1} = pos_next+n_committed;
+            // correction = pos_next + n_committed + 1.
+            // But mtp_tree_verify committed: n_past = prompt.tokens.pos_next() (id_last position),
+            // so acc_0..acc_{n-1} are at n_past+1..n_past+n_committed.
+            // correction goes at n_past + n_committed + 1.
+            // Use spec_tree_committed (actual accepted count from verify), NOT spec_draft.size()
+            // which may have been truncated by the n_draft_max cap above.
+            const llama_pos pos_correction = prompt.tokens.pos_next() + (llama_pos)spec_tree_committed + 1;
+            i_batch = batch.n_tokens;
+            spec_i_batch.clear();
+            spec_i_batch.push_back(i_batch);  // correction's batch row
+
+            common_batch_add(batch, spec_tree_correction, pos_correction, { this->id }, true);
+
+            // Advance prompt tokens: sampled + accepted (not correction yet — loop 1 will add it).
+            prompt.tokens.push_back(sampled);
+            for (auto tok : spec_draft) {
+                prompt.tokens.push_back(tok);
+            }
+            // spec_draft is consumed; clear so normal draft path doesn't re-process.
+            spec_draft.clear();
+
+            SLT_DBG(*this, "[E.1] batch: correction=%d at pos=%d (n_committed=%d)\n",
+                    (int)spec_tree_correction, (int)pos_correction, spec_tree_committed);
+            // prompt.tokens already updated above (sampled + accepted pushed).
+            // spec_draft was cleared; the unconditional push_back/insert below are no-ops.
+        } else if (spec_draft.empty()) {
             // no speculative decoding
             i_batch = batch.n_tokens;
 
@@ -440,6 +498,8 @@ struct server_slot {
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                     sampled, n_ctx, prompt.n_tokens(), truncated);
+
+            prompt.tokens.push_back(sampled);
         } else {
             SLT_DBG(*this, "generate_draft: id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
@@ -457,10 +517,10 @@ struct server_slot {
             for (auto token : spec_draft) {
                 common_batch_add(batch, token, pos0++, { this->id }, true);
             }
-        }
 
-        prompt.tokens.push_back(sampled);
-        prompt.tokens.insert(spec_draft);
+            prompt.tokens.push_back(sampled);
+            prompt.tokens.insert(spec_draft);
+        }
     }
 
     void release() {
@@ -1024,6 +1084,19 @@ private:
 
         params_base = params;
 
+        // E.1: enable kv_unified on main ctx when MTP tree mode is active.
+        // Tree verify (mtp_tree_verify) needs seq_cp(slot_seq→path_seq, partial range),
+        // which only works with kv_unified=true (n_stream=1 → partial seq_cp allowed).
+        {
+            const bool has_tree = (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) &&
+                                  (params_base.speculative.mtp.tree_branching > 1);
+            if (has_tree && !params_base.kv_unified) {
+                SRV_INF("%s: MTP tree mode: enabling kv_unified=true on main ctx "
+                        "(required for partial seq_cp in tree verify)\n", __func__);
+                params_base.kv_unified = true;
+            }
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model = llama_init->model();
@@ -1113,11 +1186,18 @@ private:
             // Phase D.2 / E.3: bump ctx_mtp n_seq_max to support per-leaf MTP KV.
             // For a tree of branching K and depth D, we need up to K^D seq_ids.
             // Use tree_max_nodes as a conservative upper bound (capped at LLAMA_MAX_SEQ-1=254).
+            //
+            // Phase E.1: also enable kv_unified=true for the MTP context when in tree mode.
+            // Without unified, n_stream=n_seq_max and each seq_id is its own stream;
+            // llama_kv_cache::seq_cp() only supports full-buffer cross-stream copies,
+            // which breaks the partial-range sibling copies in mtp_tree_draft() (Phase D.2).
+            // With unified, n_stream=1 and all seq_ids share one stream, so partial seq_cp works.
             {
                 const bool has_tree = params_base.speculative.mtp.tree_branching > 1;
                 if (has_tree) {
                     const int32_t n_mtp_seqs = std::min(params_base.speculative.mtp.tree_max_nodes, 254);
-                    cparams_mtp.n_seq_max = (uint32_t) n_mtp_seqs;
+                    cparams_mtp.n_seq_max  = (uint32_t) n_mtp_seqs;
+                    cparams_mtp.kv_unified = true;  // required for partial seq_cp in mtp_tree_draft
                 } else {
                     cparams_mtp.n_seq_max = 1; // each ctx_mtp is a single-seq context
                 }
@@ -2816,6 +2896,20 @@ private:
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
+                                // Phase E.1 slot-reuse fix: MTP slots cannot safely reuse a partial
+                                // cache-prefix match. The MTP prefill hook needs valid pending_h
+                                // for token at pos_start-1 to chain into the new ubatch's first
+                                // row; on slot reuse from a prior request, that h-state belongs to
+                                // a different generation context and pending_pos is stale.
+                                // Forcing n_past=0 makes the next decode a fresh full prefill
+                                // (ctx_mtp seq 0 already wiped by llama_context_seq_rm propagation
+                                // when slot was released). Trade-off: lose warm-prefix speedup on
+                                // MTP slots, but avoid HTTP 500 / decode-failed gap.
+                                if (slot.is_mtp() && n_past > 0 && n_past < (int32_t) input_tokens.size()) {
+                                    SLT_INF(slot, "MTP slot: dropping partial cache-prefix match (n_past=%d) to avoid prefill-hook gap\n", n_past);
+                                    n_past = 0;
+                                }
+
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
@@ -3397,6 +3491,12 @@ private:
                     continue; // sample using speculative decoding
                 }
 
+                // Phase E.1: tree-committed path handles sampling and output in its own loop.
+                // Skip loop 1 for this slot; the E.1 output loop below will consume i_batch.
+                if (slot.can_speculate() && !slot.spec_tree_ids.empty()) {
+                    continue;
+                }
+
                 const int tok_idx = slot.i_batch - i;
 
                 llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
@@ -3449,52 +3549,41 @@ private:
                 }
 
                 const auto & ids = slot.spec_tree_ids;
-                // ids = [sampled, acc_0..acc_{n-1}, correction]
-                // correction is ids.back() = sampled in this step (will be output by loop 1 above).
-                // We output ids[0..size-2] here (sampled + all accepted), and call accept() for MTP.
-                // ids.back() (correction) is handled by the non-spec loop 1 at i_batch.
+                // ids = [sampled, acc_0..acc_{n_acc-1}, correction]
+                // sampled (ids[0]) was ALREADY output by loop 1 in the PREVIOUS step.
+                // We output ids[1..] (accepted + correction) here.
+                //   - acc_0..acc_{n_acc-1}: newly accepted tokens
+                //   - correction: the correction token (last element)
+                // Sampler already accepted ids[0] in the previous step; we accept ids[1..] here.
+                // i_batch is set to -1 so loop 1 does not fire again.
 
                 const size_t n_ids = ids.size();
-                // ids = [sampled, acc_0..acc_{n_acc-1}, correction]
                 // n_acc = number of accepted draft tokens (not counting sampled or correction)
                 const int32_t n_acc = (int32_t)(n_ids - 2);
+                // Number of NEW tokens to output: acc_0..acc_{n_acc-1} + correction = n_ids - 1.
+                const size_t  n_new = n_ids - 1; // skip ids[0] (sampled, already output)
 
                 const int64_t t_current = ggml_time_us();
 
-                // All n_ids tokens are output here.
-                // correction = ids.back(); after process_token sets slot.sampled = correction,
-                // loop 1 (non-spec) will sample from i_batch (correction's batch row) to get
-                // the next token.  Loop 1 will output that next token (post-correction).
-                // BUT: we don't want loop 1 to fire for this slot if we've processed correction.
-                // We signal loop 1 by clearing i_batch.
-                // Actually: loop 1 runs regardless. We need to prevent double output.
-                //
-                // Clean solution: output ALL n_ids tokens here, including correction.
-                // Set i_batch = -1 to prevent loop 1 from firing for this slot.
-                // The correction's logits in i_batch ARE available for the NEXT step's MTP draft.
-                // But loop 1 would sample from correction's logits → that's the next-next token.
-                // We don't want to output that; instead we want to DRAFT from it next step.
-                //
-                // Conclusion: set i_batch = -1 after output; loop 1 skips this slot.
-                // Next draft() call will read correction's h-state for MTP.
-
-                slot.n_decoded += (int32_t)n_ids;  // all tokens including correction
+                slot.n_decoded += (int32_t)n_new;  // accepted + correction (sampled counted in prev step)
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
                 slot.n_draft_accepted += n_acc;
 
                 // Update MTP KV (trim to n_acc) and update spec stats.
-                common_speculative_accept(slot.spec.get(), (uint16_t)n_acc, /*last_accepted_row=*/ -1);
+                const int32_t corr_last_row = slot.spec_i_batch.empty() ? -1 :
+                    llama_context_get_output_row(slot.ctx, slot.spec_i_batch[0]);
+                slot.spec_i_batch.clear();
+                common_speculative_accept(slot.spec.get(), (uint16_t)n_acc, corr_last_row);
 
-                // Advance sampler for acc_0..acc_{n_acc-1} and correction.
-                // sampled (ids[0]) was already accepted in a prior step, skip it.
+                // Advance sampler for acc_0..acc_{n_acc-1} and correction (skip ids[0]=sampled).
                 for (size_t ai = 1; ai < n_ids; ++ai) {
                     common_sampler_accept(slot.smpl.get(), ids[ai], /* apply_grammar */ false);
                 }
 
-                // Output ALL tokens: sampled, accepted, correction.
+                // Output ids[1..] (accepted tokens + correction).
                 // After this loop, slot.sampled = correction (set by last process_token call).
                 bool slot_released = false;
-                for (size_t i = 0; i < n_ids; ++i) {
+                for (size_t i = 1; i < n_ids; ++i) {
                     completion_token_output result;
                     result.tok          = ids[i];
                     result.text_to_send = common_token_to_piece(slot.ctx, result.tok, accept_special_token(slot, result.tok));
@@ -3510,8 +3599,17 @@ private:
                     }
                 }
 
-                // Disable loop 1 for this slot (correction was already output above).
+                // Disable loop 1 for this slot (all tokens already output above).
                 slot.i_batch = -1;
+
+                // Push correction into prompt so next update_batch starts from correct pos.
+                // (sampled + accepted were already pushed during batch building.)
+                if (!slot_released) {
+                    slot.prompt.tokens.push_back(ids.back());  // correction
+                    // Trim KV past correction's position (analogous to llama_context_seq_rm
+                    // in the normal spec accept path).
+                    llama_context_seq_rm(slot.ctx, slot.id, slot.prompt.tokens.pos_next(), -1);
+                }
 
                 // Clear so we don't re-process.
                 slot.spec_tree_ids.clear();

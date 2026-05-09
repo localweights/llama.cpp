@@ -125,10 +125,18 @@ bool mtp_tree_draft(
     nodes_out.clear();
     h_vecs_out.clear();
 
-    // Clear all ctx_mtp KV from pos_start onwards before starting.
-    // This ensures a clean slate regardless of previous draft cycles.
-    for (llama_seq_id sid = 0; sid < (llama_seq_id)n_seq_max_mtp; ++sid) {
-        llama_memory_seq_rm(mem_mtp, sid, pos_start, -1);
+    // Clear all ctx_mtp KV before starting.
+    // Phase E.1 cross-request fix: path-scratch seqs (sid >= 1) carry stale KV
+    // from prior draft cycles (potentially from a different request entirely).
+    // The earlier wipe range [pos_start, -1) only cleared positions >= pos_start,
+    // leaving cells at positions < pos_start intact — which corrupts the
+    // consecutive-position invariant when a new request starts at a smaller
+    // pos_start. Seq 0 is the canonical (correctly synced via mtp_set_pending),
+    // so trim it at pos_start to preserve the committed prefix; scratch seqs
+    // are fully wiped.
+    llama_memory_seq_rm(mem_mtp, 0, pos_start, -1);
+    for (llama_seq_id sid = 1; sid < (llama_seq_id)n_seq_max_mtp; ++sid) {
+        llama_memory_seq_rm(mem_mtp, sid, 0, -1);
     }
 
     // Root sentinel: we need its MTP output h-state to seed depth-0.
@@ -545,7 +553,7 @@ int32_t mtp_tree_verify(
     }
 
     // ------------------------------------------------------------------
-    // Step 2: Assign seq_ids per root-to-leaf path via DFS.
+    // Step 2: Assign seq_ids per root-to-leaf path via DFS (path-sharing).
     //
     // The root's first child inherits base_seq; each subsequent branch at
     // any fork point gets a new seq_id (next_seq_id++).
@@ -616,86 +624,191 @@ int32_t mtp_tree_verify(
     // The trunk KV for positions [0, n_past) belongs to slot_seq.
     // Each tree path needs its own copy so that its tokens at positions
     // [n_past, n_past+depth] attend only to that path's ancestors.
-    // ------------------------------------------------------------------
-    llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
-
+    //
     // Use p1=-1 (end of buffer) to satisfy the "full buffer" requirement of
     // llama_kv_cache::seq_cp for cross-stream copies.  Cells at positions
     // >= n_past are empty (not assigned to slot_seq) so they won't be added
     // to the destination seq_ids.
+    //
+    // With kv_unified=true on ctx_tgt (same stream for all seq_ids), partial
+    // range copies also work.  With kv_unified=false, p0=0,p1=-1 passes the
+    // is_full check and only copies existing cells (positions 0..n_past-1).
+    // ------------------------------------------------------------------
+    llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+
+    // Copy positions [0, n_past) — NOT including n_past, which the root probe
+    // will add.  With kv_unified=true on ctx_tgt (same stream for all seq_ids),
+    // partial range seq_cp works via cell-tag sharing without data copy.
+    // n_past is currently the max KV position in slot_seq (most recently sampled
+    // token); we exclude it so root probe can write id_last at n_past without
+    // triggering the "positions must be consecutive" check.
     for (llama_seq_id sid : used_seq_ids) {
-        llama_memory_seq_cp(mem_tgt, slot_seq, sid, 0, -1);
+        llama_memory_seq_cp(mem_tgt, slot_seq, sid, 0, n_past);
     }
-    LOG_DBG("%s: copied prompt KV (slot_seq=%d, full buf) → %d path seq_ids\n",
-            __func__, (int)slot_seq, n_paths);
+    LOG_DBG("%s: copied prompt KV (slot_seq=%d, pos 0..%d-1) → %d path seq_ids\n",
+            __func__, (int)slot_seq, (int)n_past, n_paths);
 
     // ------------------------------------------------------------------
-    // Step 4: Build the trunk verification batch.
+    // Step 4: Sequential depth-by-depth trunk verification.
     //
-    // Batch layout (batch_idx = 0..N-1):
-    //   [0]:   root probe — id_last at pos (n_past-1), seq_id=slot_seq, logits=1.
-    //          Gives us trunk's prediction for depth-0 (the first draft token).
-    //   [1..]: all non-root nodes in BFS order (depth 0 first, then depth 1, …).
-    //          Each entry: token=node.token, pos=n_past+depth, seq_id=node.kv_seq_id.
+    // Single-pass tree verify fails for sibling branches: a path_seq whose
+    // first node is at depth d>0 has a positional gap between its root probe
+    // (n_past) and its first node (n_past+1+d), causing the llama-batch
+    // "positions not continuous" check to fire.
     //
-    // The root probe re-decodes the last prompt token.  This is cheap (1 token)
-    // and gives trunk's next-token distribution at the root position.
+    // Fix: decode one depth level at a time.
+    //   Pass d=0: root probes for all path_seqs + depth-0 nodes.
+    //   After pass d: for each path_seq that has its FIRST node at depth d+1
+    //     (i.e., a sibling branch that diverges at depth d+1), copy the decoded
+    //     position n_past+d from the parent path_seq into this sibling path_seq.
+    //     This fills the continuity gap so the next decode pass sees consecutive
+    //     positions on this sibling path.
+    //   Pass d+1: depth-(d+1) nodes (all path_seqs already have n_past..n_past+d).
     //
-    // NOTE: n_past-1 is already in the KV for slot_seq.  Re-decoding it under
-    // slot_seq does NOT write a duplicate KV entry because the KV cache uses
-    // position as the key — an existing cell at the same (seq, pos) is reused.
+    // For each path_seq, the parent is the path_seq of its shallowest ancestor
+    // that differs from it — i.e., the path_seq from which it branched.
+    //
+    // n_decode_passes = max_depth + 1.
     // ------------------------------------------------------------------
     int32_t max_depth = 0;
     for (int32_t ni = 1; ni < n_nodes; ++ni) {
         max_depth = std::max(max_depth, nodes[ni].depth);
     }
 
-    int32_t batch_idx = 0;
+    // For each non-root node, determine the depth at which its path_seq first
+    // diverges from its parent's path_seq.  We need this to know which sibling
+    // path_seqs need a bridge-copy after each decode pass.
+    //
+    // "First node at depth D on path_seq S" = the shallowest node whose
+    // kv_seq_id == S.  If that depth is > 0, then path S branches off at depth D
+    // and needs positions n_past..n_past+D-1 copied from the parent path_seq
+    // before we can place a node at n_past+D+1... wait, that's still wrong.
+    //
+    // Actually the issue is simpler: after decoding pass at depth d, every path
+    // has KV at positions 0..n_past-1 (from step 3), n_past (root probe), and
+    // n_past+1..n_past+1+d (tree nodes at depths 0..d) — BUT only for paths
+    // that had a node at each of those depths.
+    //
+    // A sibling path that branches at depth d' > 0 only has nodes at depths
+    // d'..max_depth.  Before we can decode its node at depth d'+1, it needs
+    // a KV entry at n_past+d'+1 (the parent's node).  We bridge this by copying
+    // from the parent path after we decode depth d'.
+    //
+    // Implementation: for each path_seq S, find its "first node depth" F(S).
+    // After decoding depth d == F(S)-1, copy pos n_past+F(S) from parent_path(S)
+    // to S so that S has n_past..n_past+F(S) before we decode F(S)+1... hmm.
+    //
+    // Simplest correct approach: after each depth-d decode, for every path_seq S
+    // whose first node depth > d (i.e., no node yet at depth d), copy the JUST-
+    // decoded position from the appropriate donor path_seq.  We do this for
+    // every depth that the sibling path is missing, until it has its first node.
+    //
+    // "Donor" for path_seq S at depth d = the path_seq of S's parent node at
+    // depth d.  Since path_seqs are assigned via DFS, the parent of S at depth d
+    // is the path_seq that carries the tree node at (depth=d, kv_seq_id != S).
+    //
+    // For simplicity: maintain a per-path_seq "filled_up_to" counter.
+    // path_seqs that have a node at depth d are filled at depth d by the decode.
+    // path_seqs without a node at depth d need bridging from their donor at depth d.
+    //
+    // Donor lookup: for path_seq S, find the deepest ancestor node that has a
+    // different kv_seq_id; that kv_seq_id is the donor at that depth.
+    // Walk up the tree from S's first node to find donors at each depth.
+    //
+    // Precompute: for each path_seq S, which path_seq provides its bridge-copy
+    // at each depth level where S has no node.
+    //
+    // Per path_seq: first_node_depth = min depth among nodes with kv_seq_id == S.
+    // Donor = path_seq of the parent of S's first node.
 
-    // Root probe entries.
-    //
-    // id_last is the "sampled" token from the previous trunk decode step.
-    // It has NOT yet been decoded through ctx_tgt (the server will add it in
-    // the next normal trunk verification batch).  We decode it here at position
-    // n_past under EACH PATH SEQ_ID to:
-    //   1. Fill KV position n_past for each path (ensures consecutive positions).
-    //   2. Obtain trunk's prediction for depth-0 via the first path's entry (logits=1).
-    //
-    // We do NOT add a root probe under slot_seq.  This avoids contaminating
-    // the slot's KV and ensures the server's normal batch can write id_last at
-    // n_past cleanly (no collision, no X < Y failure).
-    //
-    // Root sentinel (nodes[0]) points to the first path root probe entry.
-    //
-    // Batch layout:
-    //   [0]:       id_last @ n_past, path_seq[0], logits=1  (root probe with logits)
-    //   [1..P-1]:  id_last @ n_past, path_seq[1..P-1], logits=0  (continuity fill)
-    //   [P..]:     BFS tree nodes (depth-0 at n_past+1, depth-1 at n_past+2, etc.)
-    //
-    // After verify, path seq_ids are removed entirely (0..-1), including n_past.
-    // slot_seq is untouched during this verify decode.
-
+    // Map path_seq → first node depth and donor path_seq.
+    struct PathInfo {
+        int32_t first_depth;   // depth of first node in this path_seq (-1 = root probe only)
+        llama_seq_id donor;    // path_seq to copy from before decoding first node
+    };
+    std::vector<PathInfo> path_info(n_paths, {max_depth + 1, -1});
     for (int32_t pi = 0; pi < n_paths; ++pi) {
         const llama_seq_id sid = used_seq_ids[pi];
-        const bool want_logits = (pi == 0);  // first path provides root logits
-        tgt_batch.token[batch_idx]      = id_last;
-        tgt_batch.pos[batch_idx]        = n_past;
-        tgt_batch.n_seq_id[batch_idx]   = 1;
-        tgt_batch.seq_id[batch_idx][0]  = sid;
-        tgt_batch.logits[batch_idx]     = want_logits ? 1 : 0;
-        if (want_logits) {
-            nodes[0].batch_idx = batch_idx;  // root sentinel → first path probe
+        int32_t first_d = max_depth + 1;
+        int32_t first_ni = -1;
+        for (int32_t ni = 1; ni < n_nodes; ++ni) {
+            if (nodes[ni].kv_seq_id == sid && nodes[ni].depth < first_d) {
+                first_d  = nodes[ni].depth;
+                first_ni = ni;
+            }
         }
-        ++batch_idx;
+        path_info[pi].first_depth = first_d;
+        // Donor = kv_seq_id of the parent of this path's first node.
+        if (first_ni >= 0 && first_d > 0) {
+            const int32_t par_ni = nodes[first_ni].parent_idx;
+            if (par_ni >= 0) {
+                path_info[pi].donor = nodes[par_ni].kv_seq_id;
+            }
+        }
     }
 
-    // Non-root nodes in BFS order.
-    // Depth-0 nodes are at position n_past + 1 (since id_last is at n_past).
-    // Depth-d nodes are at position n_past + 1 + d.
-    for (int32_t d = 0; d <= max_depth; ++d) {
+    // Decode pass-by-pass, interleaved with accept walk.
+    //
+    // KEY FIX (E.1): logits buffer is overwritten by each llama_decode call.
+    // Solution: read logits for each node immediately after the decode pass
+    // that produced them.
+    //
+    // Accept walk uses a "pending_trunk_tok" model:
+    //
+    //   pending_trunk_tok = the argmax token we are looking for among the
+    //     current depth's children of cur_node.
+    //
+    //   Phase:
+    //   PHASE_FIND_CHILD: scanning depth-d children of cur_node for pending_trunk_tok.
+    //     After each depth-d decode, scan batch: if any depth-d child of cur_node
+    //     has token == pending_trunk_tok, accept it.  Then immediately read that
+    //     child's logits (valid now), compute new pending_trunk_tok, and go to
+    //     PHASE_FIND_CHILD at depth d+1.
+    //     If no match: correction = pending_trunk_tok, done.
+    //
+    //   PHASE_READ_ROOT: d=0 pass produces root probe logits.
+    //     Read root's logits → pending_trunk_tok for depth-0 children.
+    //
+    // Walk state:
+    //   cur_node = last accepted node (root=0 initially)
+    //   pending_trunk_tok = what we need to find among depth-d children (-1 if not yet set)
+    //   The root probe logits give us pending_trunk_tok after d=0 decode.
+    //   After accepting depth-d child C: read C's logits → new pending_trunk_tok for d+1.
+
+    int32_t n_accepted        = 0;
+    int32_t cur_node          = 0;      // last accepted node
+    int32_t accepted_seq      = -1;
+    bool    walk_done         = false;
+    llama_token pending_trunk_tok = -1; // trunk token to look for at next depth
+
+    bool decode_failed = false;
+    for (int32_t d = 0; d <= max_depth && !decode_failed; ++d) {
+        if (walk_done) break;
+
+        int32_t batch_idx = 0;
+
+        if (d == 0) {
+            // Root probes: one per path seq, all at position n_past.
+            for (int32_t pi = 0; pi < n_paths; ++pi) {
+                const llama_seq_id sid = used_seq_ids[pi];
+                const bool want_logits = (pi == 0);
+                tgt_batch.token[batch_idx]      = id_last;
+                tgt_batch.pos[batch_idx]        = n_past;
+                tgt_batch.n_seq_id[batch_idx]   = 1;
+                tgt_batch.seq_id[batch_idx][0]  = sid;
+                tgt_batch.logits[batch_idx]     = want_logits ? 1 : 0;
+                if (want_logits) {
+                    nodes[0].batch_idx = batch_idx;
+                }
+                ++batch_idx;
+            }
+        }
+
+        // Nodes at depth d.  Request logits for ALL depth-d children of cur_node
+        // (we need them for the accept check).  Other nodes: logits=0 (save bandwidth).
+        // But we always request logits=1 for all to keep it simple.
         for (int32_t ni = 1; ni < n_nodes; ++ni) {
             if (nodes[ni].depth != d) continue;
-
             nodes[ni].batch_idx = batch_idx;
             tgt_batch.token[batch_idx]      = nodes[ni].token;
             tgt_batch.pos[batch_idx]        = n_past + 1 + d;
@@ -704,100 +817,148 @@ int32_t mtp_tree_verify(
             tgt_batch.logits[batch_idx]     = 1;
             ++batch_idx;
         }
+
+        if (batch_idx == 0) continue;
+
+        tgt_batch.n_tokens = batch_idx;
+
+        LOG_DBG("%s: depth-pass d=%d: %d tokens\n", __func__, d, batch_idx);
+
+        llama_synchronize(ctx_tgt);
+        const int32_t rc = llama_decode(ctx_tgt, tgt_batch);
+        if (rc != 0) {
+            LOG_ERR("%s: llama_decode(ctx_tgt) depth=%d rc=%d\n", __func__, d, rc);
+            decode_failed = true;
+            break;
+        }
+
+        // --- Accept walk step (all logits in this pass are valid NOW) ---
+        if (d == 0) {
+            // Step 1: read root probe logits → pending_trunk_tok for depth-0.
+            const int32_t root_bidx = nodes[0].batch_idx;
+            if (root_bidx < 0) {
+                correction_out = id_last;
+                walk_done = true;
+            } else {
+                const float * logits = llama_get_logits_ith(ctx_tgt, root_bidx);
+                if (!logits) {
+                    correction_out = id_last;
+                    walk_done = true;
+                } else {
+                    pending_trunk_tok = (llama_token)argmax_f32(logits, n_vocab);
+                    LOG_DBG("%s: d=0 root probe batch=%d id_last=%d n_past=%d pending_trunk_tok=%d\n",
+                            __func__, root_bidx, (int)id_last, (int)n_past, (int)pending_trunk_tok);
+                }
+            }
+        }
+
+        if (walk_done) goto bridge_copy;
+
+        // Step 2: look for pending_trunk_tok among depth-d children of cur_node.
+        // Depth-d children of cur_node are nodes with depth==d and parent_idx==cur_node.
+        {
+            int32_t match = -1;
+            for (int32_t ci : nodes[cur_node].children) {
+                // nodes[ci] is at depth d (all children of cur_node are at depth d).
+                if (nodes[ci].token == pending_trunk_tok) {
+                    match = ci;
+                    break;
+                }
+            }
+
+            LOG_DBG("%s: accept-walk d=%d cur_node=%d pending_tok=%d n_children=%d match=%d\n",
+                    __func__, d, cur_node, (int)pending_trunk_tok,
+                    (int)nodes[cur_node].children.size(), match);
+
+            if (match >= 0) {
+                // Accept child at depth d.
+                accepted_out.push_back(pending_trunk_tok);
+                nodes[match].verified = true;
+                accepted_seq = nodes[match].kv_seq_id;
+                cur_node = match;
+                ++n_accepted;
+
+                // Immediately read this child's logits (valid NOW in this d pass).
+                // These logits determine pending_trunk_tok for depth d+1.
+                const int32_t child_bidx = nodes[match].batch_idx;
+                if (child_bidx < 0) {
+                    correction_out = id_last;
+                    walk_done = true;
+                } else {
+                    const float * child_logits = llama_get_logits_ith(ctx_tgt, child_bidx);
+                    if (!child_logits) {
+                        correction_out = id_last;
+                        walk_done = true;
+                    } else {
+                        const llama_token next_tok = (llama_token)argmax_f32(child_logits, n_vocab);
+                        LOG_DBG("%s: accepted depth-%d child=%d tok=%d next_pending=%d\n",
+                                __func__, d, match, (int)pending_trunk_tok, (int)next_tok);
+
+                        if (nodes[cur_node].children.empty()) {
+                            // Leaf: next_tok is the correction.
+                            correction_out = next_tok;
+                            LOG_DBG("%s: leaf correction=%d\n", __func__, (int)correction_out);
+                            walk_done = true;
+                        } else {
+                            // Non-leaf: next_tok is what we look for among depth-(d+1) children.
+                            pending_trunk_tok = next_tok;
+                        }
+                    }
+                }
+            } else {
+                // No match: pending_trunk_tok is the correction.
+                correction_out = pending_trunk_tok;
+                walk_done = true;
+            }
+        }
+
+        bridge_copy:
+
+        // After decoding depth d, bridge-copy for sibling paths that branch at d+1.
+        // A path_seq S with first_depth == d+1 needs position n_past+d+1 from
+        // its donor before we can place its first node at n_past+1+(d+1) = n_past+d+2.
+        // Actually: S's first node IS at depth d+1, position n_past+1+(d+1).
+        // For S's first node to decode correctly, S must have KV at n_past..n_past+d+1.
+        // After this pass (d), S has n_past (root probe) but not n_past+1..n_past+d+1.
+        // We copy n_past+1+d from donor to S — this gives S KV at n_past through
+        // n_past+1+d (consecutive), allowing the next decode at n_past+1+(d+1).
+        //
+        // Wait: after decoding depth d, nodes at depth d under donor have been added
+        // at pos n_past+1+d.  We need to copy pos n_past+1+d from donor to S.
+        // But S might be missing n_past+1..n_past+d as well (if it branches at d+1
+        // from a path that has those positions).  Need to copy the full range
+        // n_past+1..n_past+1+d from donor to S if S has none of those.
+        //
+        // Simpler: copy the ENTIRE range decoded so far: n_past+1..n_past+1+d.
+        // This is safe because S has n_past from its root probe, and donor has
+        // n_past+1..n_past+1+d from decode passes 0..d.  After this copy,
+        // S has n_past..n_past+1+d (consecutive), ready for depth d+1 nodes.
+        for (int32_t pi = 0; pi < n_paths; ++pi) {
+            if (path_info[pi].first_depth == d + 1 && path_info[pi].donor >= 0) {
+                const llama_seq_id donor_sid = path_info[pi].donor;
+                const llama_seq_id sibling_sid = used_seq_ids[pi];
+                // Copy positions n_past+1 .. n_past+1+d (inclusive).
+                // seq_cp range: p0=n_past+1, p1=n_past+2+d (exclusive end).
+                llama_memory_seq_cp(mem_tgt, donor_sid, sibling_sid,
+                                    n_past + 1, n_past + 2 + d);
+                LOG_DBG("%s: bridge-copy depth=%d: pos [%d..%d] donor_sid=%d → sibling_sid=%d\n",
+                        __func__, d, (int)(n_past+1), (int)(n_past+1+d),
+                        (int)donor_sid, (int)sibling_sid);
+            }
+        }
     }
-    tgt_batch.n_tokens = batch_idx;
 
-    LOG_DBG("%s: trunk batch: %d tokens (%d path probes + %d tree nodes), max_depth=%d\n",
-            __func__, batch_idx, n_paths, batch_idx - n_paths, max_depth);
+    // Guard: if accept walk never resolved (shouldn't happen), fallback.
+    if (!walk_done && correction_out < 0) {
+        correction_out = id_last;
+    }
 
-    // ------------------------------------------------------------------
-    // Step 5: Run trunk forward pass.
-    // ------------------------------------------------------------------
-    llama_synchronize(ctx_tgt);
-    const int32_t dec_rc = llama_decode(ctx_tgt, tgt_batch);
-    if (dec_rc != 0) {
-        LOG_ERR("%s: llama_decode(ctx_tgt) rc=%d — tree verify failed, cleaning up\n",
-                __func__, dec_rc);
+    if (decode_failed) {
         for (llama_seq_id sid : used_seq_ids) {
             llama_memory_seq_rm(mem_tgt, sid, 0, -1);
         }
         correction_out = -1;
         return 0;
-    }
-
-    // ------------------------------------------------------------------
-    // Step 6: Accept walk — greedy tree traversal from root.
-    //
-    // accepted_out = [accepted_tok_0, ..., accepted_tok_{k-1}] (length = n_accepted)
-    // correction_out = the correction token (always set)
-    //
-    // Phase D.1 change: correction is returned separately.  The caller (server)
-    // needs only correction_out to generate the next token; it does not need to
-    // re-run the full accepted prefix through the trunk.
-    // ------------------------------------------------------------------
-    int32_t n_accepted   = 0;
-    int32_t cur_node     = 0; // root sentinel
-    int32_t accepted_seq = -1; // seq_id of the accepted path (for D.1 commit)
-
-    for (;;) {
-        const int32_t cur_bidx = nodes[cur_node].batch_idx;
-        if (cur_bidx < 0) {
-            LOG_ERR("%s: node %d has batch_idx=-1 (unexpected)\n", __func__, cur_node);
-            // Emit fallback correction (id_last) so caller isn't stuck.
-            correction_out = id_last;
-            break;
-        }
-        const float * logits = llama_get_logits_ith(ctx_tgt, cur_bidx);
-        if (!logits) {
-            LOG_ERR("%s: null logits at batch_idx=%d\n", __func__, cur_bidx);
-            correction_out = id_last;
-            break;
-        }
-        const llama_token trunk_tok = (llama_token)argmax_f32(logits, n_vocab);
-
-        const auto & ch = nodes[cur_node].children;
-        LOG_DBG("%s: node=%d depth=%d batch=%d trunk_tok=%d n_children=%d\n",
-                __func__, cur_node, nodes[cur_node].depth, cur_bidx,
-                (int)trunk_tok, (int)ch.size());
-
-        // Find matching child.
-        int32_t match = -1;
-        for (int32_t ci : ch) {
-            if (nodes[ci].token == trunk_tok) {
-                match = ci;
-                break;
-            }
-        }
-
-        if (match >= 0) {
-            // Accept this child's token.
-            accepted_out.push_back(trunk_tok);
-            nodes[match].verified = true;
-            accepted_seq = nodes[match].kv_seq_id; // track which path seq we're on
-            cur_node = match;
-            ++n_accepted;
-        } else {
-            // Rejection: trunk_tok is the correction.
-            correction_out = trunk_tok;
-            break;
-        }
-
-        // If we've accepted a leaf (no children), get correction from leaf logits.
-        if (nodes[cur_node].children.empty()) {
-            const int32_t leaf_bidx = nodes[cur_node].batch_idx;
-            if (leaf_bidx >= 0) {
-                const float * leaf_logits = llama_get_logits_ith(ctx_tgt, leaf_bidx);
-                if (leaf_logits) {
-                    correction_out = (llama_token)argmax_f32(leaf_logits, n_vocab);
-                    LOG_DBG("%s: leaf correction=%d\n", __func__, (int)correction_out);
-                } else {
-                    correction_out = id_last; // fallback
-                }
-            } else {
-                correction_out = id_last; // fallback
-            }
-            break;
-        }
     }
 
     LOG_INF("%s: tree verify: %d draft tokens accepted, correction=%d\n",
@@ -821,24 +982,55 @@ int32_t mtp_tree_verify(
     // (When n_accepted==0 the caller still does the normal single-token decode.)
     // ------------------------------------------------------------------
     if (commit_to_slot && n_accepted > 0 && accepted_seq >= 0) {
-        // Copy positions n_past .. n_past+n_accepted (inclusive) from accepted_seq to slot_seq.
-        // p1 is exclusive, so p1 = n_past + n_accepted + 1.
-        llama_memory_seq_cp(mem_tgt, (llama_seq_id)accepted_seq, slot_seq,
-                            n_past, n_past + n_accepted + 1);
-        LOG_DBG("%s: D.1 commit: copied pos [%d..%d] from seq %d to slot_seq %d\n",
-                __func__, (int)n_past, (int)(n_past + n_accepted),
-                (int)accepted_seq, (int)slot_seq);
+        // E.1 commit: copy accepted path KV from path seq to slot_seq.
+        // The path seq (accepted_seq) has:
+        //   - positions 0..n_past-1: copied from slot_seq in step 3
+        //   - position n_past:       id_last (from root probe in step 4)
+        //   - positions n_past+1..n_past+n_accepted: accepted tree node KV
+        //
+        // We copy n_past..n_past+n_accepted from accepted_seq to slot_seq.
+        // slot_seq currently has 0..n_past-1; after copy it has 0..n_past+n_accepted.
+        // This allows the server to skip re-decoding id_last and the accepted tokens.
+        //
+        // With kv_unified=true on ctx_tgt (same stream → s0==s1), partial range
+        // seq_cp works directly.  With kv_unified=false, cross-stream partial copy
+        // would need p0=0,p1=-1; here we use the exact range since kv_unified=true
+        // is required for E.1 to be active.
+        // Only copy positions not already in slot_seq.
+        // Normally slot_seq has 0..n_past-1, so we copy n_past..n_past+n_accepted.
+        // If ctx_mtp state is slightly off (e.g., pending_pos not fully propagated),
+        // slot_seq might already have n_past; skip those to avoid double-tagging
+        // which would violate the seq_add !test assertion in kv_cells.h.
+        const llama_pos slot_max = llama_memory_seq_pos_max(mem_tgt, slot_seq);
+        const llama_pos copy_from = std::max(n_past, slot_max + 1);
+        const llama_pos copy_to   = n_past + n_accepted + 1; // exclusive
+        if (copy_from < copy_to) {
+            llama_memory_seq_cp(mem_tgt, (llama_seq_id)accepted_seq,
+                                slot_seq, copy_from, copy_to);
+            LOG_INF("%s: E.1 committed %d positions [%d..%d] from seq %d to slot_seq %d "
+                    "(slot_max_was=%d)\n",
+                    __func__, (int)(copy_to - copy_from),
+                    (int)copy_from, (int)(copy_to - 1),
+                    (int)accepted_seq, (int)slot_seq, (int)slot_max);
+        } else {
+            LOG_WRN("%s: E.1 skip commit — slot_seq already has up to %d (copy_from=%d >= copy_to=%d)\n",
+                    __func__, (int)slot_max, (int)copy_from, (int)copy_to);
+        }
     }
 
     // ------------------------------------------------------------------
     // Step 8: Cleanup — remove all path seq_ids from ctx_tgt's KV.
+    // Path seq_ids hold prompt copy (0..n_past-1) + root probe (n_past) +
+    // tree node KV (n_past+1..n_past+d).
+    // For E.1: slot_seq now has 0..n_past+n_accepted; path seqs cleaned up.
+    // For non-E.1: slot_seq still has 0..n_past-1 (id_last not yet decoded).
     // ------------------------------------------------------------------
     for (llama_seq_id sid : used_seq_ids) {
         llama_memory_seq_rm(mem_tgt, sid, 0, -1);
     }
-    LOG_DBG("%s: removed %d path seq_ids from ctx_tgt KV (slot_seq=%d%s)\n",
-            __func__, n_paths, (int)slot_seq,
-            (commit_to_slot && n_accepted > 0) ? " — committed accepted path" : "");
+
+    LOG_DBG("%s: removed %d path seq_ids from ctx_tgt KV\n",
+            __func__, n_paths);
 
     return n_accepted;
 }
