@@ -135,6 +135,22 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
+        // Recurrent rejected partial rollback (e.g. n_rs_seq budget exceeded).
+        // The hybrid contract requires both halves to agree on stored positions:
+        // if we leave the attention half untrimmed while the recurrent half is
+        // unchanged, server hot paths (which ignore the bool return) will keep
+        // appending at advancing logical positions while stale attn cells from
+        // rejected speculative branches accumulate, eventually causing
+        // out-of-bounds gathers in flash-attn (CUDA illegal memory access on
+        // hybrid arches like Qwen3.5-MoE after ~10 cache-reuse cycles).
+        //
+        // Escalate to a full clear of BOTH halves so the slot's attn KV state
+        // is consistent with the (now-empty) recurrent state. We still return
+        // false to preserve the partial-rm-not-supported contract for callers
+        // that DO honor it (they will then go through the full re-prefill /
+        // checkpoint-restore path).
+        mem_recr->seq_rm(seq_id, -1, -1);
+        mem_attn->seq_rm(seq_id, -1, -1);
         return false;
     }
     return mem_attn->seq_rm(seq_id, p0, p1);
