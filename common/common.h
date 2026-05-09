@@ -352,6 +352,14 @@ struct common_params_speculative_mtp {
     llama_model        * model  = nullptr;
     llama_context_params cparams;
     llama_seq_id         seq_id = 0; // trunk seq_id this slot drives (passed to llama_set_mtp)
+
+    // EAGLE-2 tree drafting params (Phase A+)
+    // tree_branching=1 → existing linear AR chain (default, backward compat)
+    // tree_branching>1 → parallel MTP forward: at each step expand top-K candidates
+    int32_t tree_branching  = 1;   // K: top-K candidates per step; 1 = linear
+    int32_t tree_max_depth  = 6;   // D: max tree depth (unused in Phase A single-depth)
+    int32_t tree_max_nodes  = 40;  // B: total node budget
+    float   tree_p_min      = 0.0f;// cumulative log-prob floor (log space); 0 = disabled
 };
 
 struct common_params_speculative {

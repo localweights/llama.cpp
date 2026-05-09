@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "tree-spec.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -642,8 +643,12 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
         // ctx_mtp is n_seq_max=1; its internal KV always uses seq 0.
         // The seq_id here identifies which trunk slot owns this ctx_mtp.
-        batch = llama_batch_init(/*n_tokens=*/ 1, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
-        batch.token = (llama_token *) malloc(sizeof(llama_token));
+        // Allocate batch with TREE_SPEC_MAX_BATCH capacity so the same batch
+        // object can be reused for both the linear path (n_tokens=1) and the
+        // tree-draft parallel expansion path (n_tokens=K).
+        static constexpr int32_t TREE_SPEC_MAX_BATCH = 64;
+        batch = llama_batch_init(/*n_tokens=*/ TREE_SPEC_MAX_BATCH, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
+        batch.token = (llama_token *) malloc(sizeof(llama_token) * TREE_SPEC_MAX_BATCH);
         batch.n_tokens     = 1;
         batch.n_seq_id[0]  = 1;
         batch.seq_id[0][0] = 0; // ctx_mtp internal seq; always 0
@@ -729,6 +734,61 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
         llama_token cond_tok = id_last;
         llama_pos   pos      = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0) + 1;
+
+        // EAGLE-2 tree drafting (Phase A): parallel MTP forward.
+        // When tree_branching > 1, delegate to mtp_tree_draft() instead of
+        // the AR loop below.  For Phase A the accepted path is still linear
+        // (leftmost branch only) so the accept rate is identical to branching=1.
+        // This block proves that n_tokens>1 MTP decode works correctly.
+        if (params.mtp.tree_branching > 1) {
+            // Resolve root hidden state (same logic as the AR loop below)
+            std::vector<float> root_h(n_embd, 0.0f);
+            if (last_h_valid) {
+                GGML_ASSERT((int32_t) last_h_vec.size() == n_embd);
+                root_h = last_h_vec;
+                last_h_valid = false;
+            } else {
+                ggml_tensor * src = llama_context_get_t_h_pre_norm(ctx_tgt);
+                if (!src) {
+                    LOG_WRN("%s: [tree] missing t_h_pre_norm; aborting tree draft\n", __func__);
+                    return;
+                }
+                const int32_t n_rows = (int32_t) src->ne[1];
+                int32_t src_row = n_rows - 1; // default: last row
+                if (last_n_accepted >= 0 && last_accepted_row < 0) {
+                    src_row = std::min(last_n_accepted, n_rows - 1);
+                } else if (last_accepted_row >= 0) {
+                    src_row = std::min(last_accepted_row, n_rows - 1);
+                }
+                src_row = std::max(src_row, 0);
+                last_n_accepted   = -1;
+                last_accepted_row = -1;
+                root_h.resize(n_embd);
+                llama_synchronize(ctx_tgt);
+                ggml_backend_tensor_get(src, root_h.data(),
+                                        (size_t) src_row * row_bytes, row_bytes);
+            }
+
+            mtp_tree_config cfg;
+            cfg.branching = params.mtp.tree_branching;
+            cfg.max_depth = params.mtp.tree_max_depth;
+            cfg.max_nodes = params.mtp.tree_max_nodes;
+            cfg.p_min     = params.mtp.tree_p_min;
+
+            std::vector<mtp_tree_node> nodes;
+            mtp_h_vecs h_vecs;
+
+            const bool ok = mtp_tree_draft(ctx_mtp, batch, cfg, root_h,
+                                           n_embd, cond_tok, pos,
+                                           nodes, h_vecs, draft_tokens);
+            if (!ok) {
+                LOG_WRN("%s: [tree] mtp_tree_draft failed; falling back to 0 drafts\n", __func__);
+                draft_tokens.clear();
+            }
+
+            last_n_drafted = (uint16_t) draft_tokens.size();
+            return;
+        }
 
         // auto-regressive loop for MTP
         for (int32_t k = 0; k < n_max; ++k) {
