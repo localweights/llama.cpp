@@ -638,6 +638,14 @@ struct common_speculative_state_mtp : public common_speculative_state {
     //   tree_correction        → the correction token from the tree verify
     int32_t     tree_n_committed  = -1;             // -1 = no commit pending
     llama_token tree_correction   = -1;             // correction token from last tree verify
+    // Phase E.1 counter accounting:
+    //   tree_n_drafted = total number of non-root nodes produced by the last
+    //   mtp_tree_draft (all branches × depth, e.g. branching=2 depth=2 fully
+    //   expanded → 4 + 2 = 6 nodes; with budget=4 → 4 nodes).  This is the
+    //   correct denominator for "draft tokens generated" in tree mode.
+    //   spec_draft.size() only reflects the accepted (chosen) path length.
+    //   Reset to -1 on every draft() call; set whenever mtp_tree_draft runs.
+    int32_t     tree_n_drafted    = -1;             // -1 = last draft was linear
 
     common_speculative_state_mtp(enum common_speculative_type type,
                                  llama_context * ctx_tgt,
@@ -743,6 +751,8 @@ struct common_speculative_state_mtp : public common_speculative_state {
         // Phase D: reset tree commit state at start of each draft cycle.
         tree_n_committed = -1;
         tree_correction  = -1;
+        // E.1 counter fix: reset tree node count; set below when tree_draft runs.
+        tree_n_drafted   = -1;
 
         if (last_n_drafted > 0) {
             const int32_t n_to_drop = (int32_t) last_n_drafted - 1;
@@ -827,8 +837,16 @@ struct common_speculative_state_mtp : public common_speculative_state {
                 last_n_drafted    = 0;
                 tree_n_committed  = -1;
                 tree_correction   = -1;
+                tree_n_drafted    = 0;
                 return;
             }
+
+            // E.1 counter fix: record TOTAL drafted node count (all branches × depth,
+            // excluding root sentinel).  Used by server as the correct denominator
+            // for n_draft_total — distinct from spec_draft.size() which is just the
+            // accepted path length.  Example: branching=2 depth=2 max-nodes=4 →
+            // tree_n_drafted = 4 (vs. accepted-path which is at most 2).
+            tree_n_drafted = (int32_t) tree_nodes.size() - 1;
 
             // Phase E.1: run trunk verification with direct KV commit.
             // commit_to_slot=true: accepted path KV is committed to slot_seq by
@@ -1782,6 +1800,11 @@ int32_t common_speculative_tree_n_committed(const common_speculative * spec) {
 llama_token common_speculative_tree_correction(const common_speculative * spec) {
     const auto * mtp = get_active_mtp(spec);
     return mtp ? mtp->tree_correction : (llama_token)-1;
+}
+
+int32_t common_speculative_tree_n_drafted(const common_speculative * spec) {
+    const auto * mtp = get_active_mtp(spec);
+    return mtp ? mtp->tree_n_drafted : -1;
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

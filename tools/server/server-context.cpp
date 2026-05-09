@@ -393,14 +393,27 @@ struct server_slot {
 
                 // generate a new draft
                 spec_draft = common_speculative_draft(spec.get(), params_spec, tokens, sampled);
-                n_draft_total += spec_draft.size();
+
+                // E.1 counter fix: in tree mode, spec_draft is the accepted-path tokens
+                // (so accepted == drafted, ratio always 100%).  Use the tree's full node
+                // count for the denominator instead — this is the true number of draft
+                // tokens emitted to the verify step.  Linear mode: tree_n_drafted == -1,
+                // so we fall back to spec_draft.size() (the AR chain length).
+                {
+                    const int32_t n_tree_drafted = common_speculative_tree_n_drafted(spec.get());
+                    n_draft_total += (n_tree_drafted >= 0)
+                        ? (size_t) n_tree_drafted
+                        : spec_draft.size();
+                }
 
                 // Phase E.1: check if tree verify already committed the accepted KV.
                 const int32_t n_committed = common_speculative_tree_n_committed(spec.get());
                 if (n_committed >= 0) {
                     spec_tree_committed  = n_committed;
                     spec_tree_correction = common_speculative_tree_correction(spec.get());
-                    SLT_DBG(*this, "[E.1] tree committed: n_acc=%d correction=%d\n",
+                    // E.1 fire-rate observability: promote to INFO so we can grep
+                    // the server log to confirm the skip-redecode path is active.
+                    SLT_INF(*this, "[E.1] tree committed: n_acc=%d correction=%d (skip-redecode active)\n",
                             n_committed, (int)spec_tree_correction);
                 }
 
@@ -486,8 +499,12 @@ struct server_slot {
             // spec_draft is consumed; clear so normal draft path doesn't re-process.
             spec_draft.clear();
 
-            SLT_DBG(*this, "[E.1] batch: correction=%d at pos=%d (n_committed=%d)\n",
-                    (int)spec_tree_correction, (int)pos_correction, spec_tree_committed);
+            // E.1 fire-rate observability: this is the actual skip site —
+            // only the correction token is added to the trunk batch; the full
+            // accepted prefix is NOT re-decoded (KV already in slot_seq).
+            SLT_INF(*this, "[E.1] skip-redecode FIRE: correction=%d at pos=%d (n_committed=%d, batch_n=1 instead of %d)\n",
+                    (int)spec_tree_correction, (int)pos_correction, spec_tree_committed,
+                    spec_tree_committed + 2);
             // prompt.tokens already updated above (sampled + accepted pushed).
             // spec_draft was cleared; the unconditional push_back/insert below are no-ops.
         } else if (spec_draft.empty()) {
