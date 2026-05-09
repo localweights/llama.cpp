@@ -1,13 +1,13 @@
 #pragma once
 
-// EAGLE-2 Phase A: parallel MTP forward proof
+// EAGLE-2 Phase B: multi-depth tree expansion
 // tree-spec.h — data structures and public interface for tree drafting
 //
-// Phase A scope: single-depth expansion only.  At each draft step feed N
-// top-K candidates from the previous logit row into ctx_mtp simultaneously,
-// collect logits, but still verify only the leftmost (path-0) branch so the
-// accept rate is identical to the linear chain.  This proves n_tokens>1 MTP
-// forward works.
+// Phase B: build a static fixed-topology tree of width `branching` (K) and
+// depth `max_depth` (D).  At each depth d, expand every leaf at depth d-1
+// into K children via a single parallel llama_decode call.  Total nodes:
+// 1 + K + K² + … + K^D.  Verification still uses path-0 only (Phase C wires
+// real trunk verification).  KV management is "cold" per depth (Phase D fix).
 
 #include "llama.h"
 #include "common.h"
@@ -48,26 +48,27 @@ using mtp_h_vecs = std::vector<std::vector<float>>;
 // Public interface
 // ---------------------------------------------------------------------------
 
-// mtp_tree_draft() — Phase A parallel MTP forward.
+// mtp_tree_draft() — Phase B multi-depth tree expansion.
 //
-// Expands ONE depth level (depth=0→depth=1) using branching=K parallel MTP
-// decodes in a single llama_decode(ctx_mtp, batch) call.
+// Expands cfg.max_depth levels (root → K → K² → … → K^D children) using
+// one llama_decode(ctx_mtp, batch) call per depth level.
 //
 // Inputs:
 //   ctx_mtp       — MTP draft context
 //   batch         — pre-allocated batch (capacity >= max_nodes); modified in place
-//   cfg           — tree configuration
+//   cfg           — tree configuration (branching, max_depth, max_nodes, p_min)
 //   root_h_vec    — hidden state for root (from last_h_pre_norm)
 //   n_embd        — embedding dim
 //   id_last       — last accepted token (root cond_tok)
-//   pos_start     — position for depth-0 expansion in ctx_mtp KV
+//   pos_start     — base position in ctx_mtp KV; depth d uses pos_start+d+1
 //
 // Outputs:
-//   nodes_out     — flat node array built by this call (root sentinel at [0])
-//   h_vecs_out    — hidden states for each node (index mirrors nodes_out)
+//   nodes_out     — flat node array (root sentinel at [0], depth 0 at [1..K], …)
+//   h_vecs_out    — MTP output hidden states per node (index mirrors nodes_out)
 //   draft_tokens  — leftmost-path tokens (path-0) for linear-compatible accept
 //
-// Returns true on success, false if llama_decode failed.
+// Returns true on success, false if root llama_decode failed.
+// (Partial failure mid-tree still returns true with a shorter draft.)
 bool mtp_tree_draft(
         llama_context                 * ctx_mtp,
         llama_batch                   & batch,

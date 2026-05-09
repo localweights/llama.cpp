@@ -3602,6 +3602,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TREE_BRANCHING"));
     add_opt(common_arg(
+        {"--spec-tree-max-depth"}, "N",
+        string_format("EAGLE-2 tree drafting: maximum expansion depth (default: %d, 1 = Phase A single-depth)", params.speculative.mtp.tree_max_depth),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("spec-tree-max-depth must be >= 1");
+            }
+            params.speculative.mtp.tree_max_depth = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TREE_MAX_DEPTH"));
+    add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),
         [](common_params & params, int value) {
