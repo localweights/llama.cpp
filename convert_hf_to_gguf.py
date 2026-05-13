@@ -5514,6 +5514,15 @@ class _Qwen35MtpMixin:
         self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("mtp_num_hidden_layers", 0)
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
+    @classmethod
+    def filter_tensors(cls, item):
+        # Override Qwen3NextModel's mtp skip so MTP tensors flow through to modify_tensors.
+        name, gen = item
+        if name.startswith("mtp"):
+            # bypass parent's mtp-skip; pass to TextModel base filter
+            return TextModel.filter_tensors((name, gen))
+        return super().filter_tensors(item)
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         if (n := self.hparams.get("mtp_num_hidden_layers", 0)) > 0:

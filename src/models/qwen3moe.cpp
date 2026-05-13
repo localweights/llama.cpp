@@ -19,7 +19,7 @@ void llama_model_qwen3moe::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_qwen3moe::load_arch_tensors(llama_model_loader &) {
+void llama_model_qwen3moe::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
@@ -31,6 +31,23 @@ void llama_model_qwen3moe::load_arch_tensors(llama_model_loader &) {
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
     }
+
+    // Trunk n_ff_exp (default for all layers).
+    const int64_t n_ff_exp_trunk = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
+
+    // Optional MTP-block override (qwen3moe.mtp.expert_feed_forward_length).
+    // If set and != trunk's, MTP tail layers (i >= n_layer - nextn_predict_layers)
+    // use this size for their MoE expert tensors. Trunk layers still use trunk size.
+    uint32_t mtp_n_ff_exp_u = static_cast<uint32_t>(n_ff_exp_trunk);
+    ml.get_key(LLM_KV_MTP_EXPERT_FEED_FORWARD_LENGTH, mtp_n_ff_exp_u, false);
+    const int64_t n_ff_exp_mtp = static_cast<int64_t>(mtp_n_ff_exp_u);
+    if (n_ff_exp_mtp != n_ff_exp_trunk) {
+        LLAMA_LOG_INFO("%s: MTP tail layers use n_ff_exp=%lld (trunk uses %lld)\n",
+                       __func__, (long long)n_ff_exp_mtp, (long long)n_ff_exp_trunk);
+    }
+    const uint32_t n_main = hparams.nextn_predict_layers > 0
+        ? (n_layer - hparams.nextn_predict_layers)
+        : static_cast<uint32_t>(n_layer);
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
@@ -54,8 +71,9 @@ void llama_model_qwen3moe::load_arch_tensors(llama_model_loader &) {
             throw std::runtime_error("n_expert_used must be > 0 for QWEN3MOE");
         }
 
-        // MoE branch
-        const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
+        // MoE branch — pick MTP override for tail layers, trunk size otherwise.
+        const int64_t n_ff_exp =
+            (static_cast<uint32_t>(i) >= n_main) ? n_ff_exp_mtp : n_ff_exp_trunk;
 
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);

@@ -19,7 +19,7 @@ void llama_model_qwen3moe_mtp::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
-void llama_model_qwen3moe_mtp::load_arch_tensors(llama_model_loader &) {
+void llama_model_qwen3moe_mtp::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), { n_embd, n_vocab }, 0);
@@ -29,7 +29,19 @@ void llama_model_qwen3moe_mtp::load_arch_tensors(llama_model_loader &) {
         output  = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
-    const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
+    const int64_t n_ff_exp_trunk = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
+
+    // MTP block can have a different expert FFN size than trunk. If
+    // qwen3moe.mtp.expert_feed_forward_length is set, use it for MTP layers;
+    // otherwise fall back to trunk's n_ff_exp.
+    uint32_t mtp_n_ff_exp_u = static_cast<uint32_t>(n_ff_exp_trunk);
+    ml.get_key(LLM_KV_MTP_EXPERT_FEED_FORWARD_LENGTH, mtp_n_ff_exp_u, false);
+    const int64_t n_ff_exp_mtp = static_cast<int64_t>(mtp_n_ff_exp_u);
+    if (n_ff_exp_mtp != n_ff_exp_trunk) {
+        LLAMA_LOG_INFO("%s: MTP block uses n_ff_exp=%lld (trunk uses %lld)\n",
+                       __func__, (long long)n_ff_exp_mtp, (long long)n_ff_exp_trunk);
+    }
+    const int64_t n_ff_exp = n_ff_exp_mtp;  // legacy alias for the MTP code below
 
     const uint32_t n_main = n_layer - hparams.nextn_predict_layers;
     for (int i = 0; i < n_layer; ++i) {
