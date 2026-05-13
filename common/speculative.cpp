@@ -1656,7 +1656,14 @@ common_speculative * common_speculative_init(
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
-        bool has_draft = !params.draft.mparams.path.empty();
+        // has_draft must be gated by spec-type. --mtp-head writes the GGUF path
+        // into the same `draft.mparams.path` field but the gemma4_assistant
+        // arch CANNOT be loaded as a primary draft model — it throws at init.
+        // Without this gate the legacy draft impl gets queued alongside the
+        // gemma4_assistant impl and segfaults on the null ctx_dft.
+        bool has_draft = !params.draft.mparams.path.empty()
+            && (params.type == COMMON_SPECULATIVE_TYPE_NONE
+                || params.type == COMMON_SPECULATIVE_TYPE_DRAFT);
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
         bool has_mtp = (params.type == COMMON_SPECULATIVE_TYPE_MTP) && (ctx_mtp != nullptr);
         bool has_gemma4_assistant = (params.type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT)
