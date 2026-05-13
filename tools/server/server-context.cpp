@@ -946,6 +946,11 @@ private:
     // Writes f16 rows to <tap_out_dir>/h_pre_norm.bin DURING graph compute,
     // bypassing post-compute buffer reuse that affects the named-tensor scan path.
     std::ofstream tap_h_pre_norm_file;
+    // Pre-allocated buffers reused across tap callbacks. Eliminates per-window
+    // 16MB std::vector heap allocations + page faults that bottlenecked the
+    // tap-eval-cb hot core. Resized on first call, kept for lifetime of server.
+    std::vector<uint8_t>     tap_host_buf;
+    std::vector<ggml_fp16_t> tap_half_buf;
 
     // MTP-debug tap: env LLAMA_MTP_TAP=name1,name2,... captures named tensors
     // from the MTP graph into <tap_out_dir>/mtp_<name>.bin (f16, 16-byte header).
@@ -956,30 +961,41 @@ private:
         if (!self) return ask ? false : true;
         if (!t->name) return ask ? false : true;
 
-        // h_pre_norm tap (original path)
+        // h_pre_norm tap (per-window batched path).
+        // Optimizations vs original:
+        //   1. Reuse pre-allocated host_buf / half_buf (no per-call std::vector
+        //      heap alloc + page faults for 16MB f16 row block at 4095×n_embd).
+        //   2. F16 fast-path: write host_buf directly, skip redundant memcpy.
+        //   3. Drop explicit flush(): OS page cache handles persistence; capture
+        //      is resumable via h_pre_norm.bin file size on restart.
         if (std::strcmp(t->name, "h_pre_norm") == 0) {
             if (ask) return true;
             if (!self->tap_h_pre_norm_file.is_open()) return true;
             const size_t nbytes = ggml_nbytes(t);
             const size_t n_elem = nbytes / ggml_element_size(t);
-            std::vector<uint8_t> host(nbytes);
-            ggml_backend_tensor_get(t, host.data(), 0, nbytes);
-            std::vector<ggml_fp16_t> half(n_elem);
-            if (t->type == GGML_TYPE_F32) {
-                const float * f32 = (const float *) host.data();
-                for (size_t k = 0; k < n_elem; k++) half[k] = ggml_fp32_to_fp16(f32[k]);
-            } else if (t->type == GGML_TYPE_F16) {
-                std::memcpy(half.data(), host.data(), n_elem * sizeof(ggml_fp16_t));
-            } else if (t->type == GGML_TYPE_BF16) {
-                const uint16_t * bf = (const uint16_t *) host.data();
-                for (size_t k = 0; k < n_elem; k++) {
-                    uint32_t u = ((uint32_t) bf[k]) << 16;
-                    float f; std::memcpy(&f, &u, sizeof(float));
-                    half[k] = ggml_fp32_to_fp16(f);
-                }
-            } else { return true; }
-            self->tap_h_pre_norm_file.write((const char *) half.data(), n_elem * sizeof(ggml_fp16_t));
-            self->tap_h_pre_norm_file.flush();
+            if (self->tap_host_buf.size() < nbytes) self->tap_host_buf.resize(nbytes);
+            ggml_backend_tensor_get(t, self->tap_host_buf.data(), 0, nbytes);
+            if (t->type == GGML_TYPE_F16) {
+                self->tap_h_pre_norm_file.write(
+                    (const char *) self->tap_host_buf.data(),
+                    n_elem * sizeof(ggml_fp16_t));
+            } else {
+                if (self->tap_half_buf.size() < n_elem) self->tap_half_buf.resize(n_elem);
+                if (t->type == GGML_TYPE_F32) {
+                    const float * f32 = (const float *) self->tap_host_buf.data();
+                    for (size_t k = 0; k < n_elem; k++) self->tap_half_buf[k] = ggml_fp32_to_fp16(f32[k]);
+                } else if (t->type == GGML_TYPE_BF16) {
+                    const uint16_t * bf = (const uint16_t *) self->tap_host_buf.data();
+                    for (size_t k = 0; k < n_elem; k++) {
+                        uint32_t u = ((uint32_t) bf[k]) << 16;
+                        float f; std::memcpy(&f, &u, sizeof(float));
+                        self->tap_half_buf[k] = ggml_fp32_to_fp16(f);
+                    }
+                } else { return true; }
+                self->tap_h_pre_norm_file.write(
+                    (const char *) self->tap_half_buf.data(),
+                    n_elem * sizeof(ggml_fp16_t));
+            }
             return true;
         }
 
