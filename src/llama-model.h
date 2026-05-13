@@ -549,6 +549,10 @@ struct llama_model {
     struct ggml_tensor * mtp_centroids       = nullptr;
     struct ggml_tensor * mtp_token_ordering  = nullptr;
 
+    // Nested assistant model loaded via llama_model_load_mtp_from_file
+    // (owns its own weight tensors; freed on parent model destruction)
+    std::unique_ptr<llama_model> mtp_assistant;
+
     // gemma3n altup
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;

@@ -33,6 +33,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
+    LLM_GRAPH_TYPE_MTP,  // Gemma 4 assistant drafter — reads target KV, no KV write
 };
 
 enum llm_ffn_op_type {
@@ -119,6 +120,19 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
+};
+
+// Gemma 4 MTP: last target token id + backbone hidden (n_bb floats) for a single step
+class llm_graph_input_mtp : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp() = default;
+    ~llm_graph_input_mtp() override = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * inp_last_token = nullptr; // I32 [1]
+    ggml_tensor * inp_h_prev     = nullptr; // F32 [n_bb, 1]
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -573,16 +587,20 @@ struct llm_graph_params {
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
         // first check the ubatch
+        // For MTP graphs we feed BOTH token and embd at the same time (the embedding is the
+        // backbone hidden state, the token is the previously sampled draft). The default
+        // check below requires at least one of those to be null in both ubatches; relax it
+        // for MTP so steps 1..N-1 inside a single decode_mtp can reuse the encoded graph.
+        const bool token_compat = (gtype == LLM_GRAPH_TYPE_MTP)
+            ? (!ubatch.token == !other.ubatch.token && !ubatch.embd == !other.ubatch.embd)
+            : ((!ubatch.token && !other.ubatch.token) || (!ubatch.embd && !other.ubatch.embd));
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
             ubatch.n_tokens     == other.ubatch.n_tokens &&
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
-            (
-                (!ubatch.token && !other.ubatch.token) ||
-                (!ubatch.embd  && !other.ubatch.embd)
-            );
+            token_compat;
 
         // when we split the batch using "equal_seqs" we have to verify that the participating sequences are the same
         //   the reason is because the set of attention streams would be different for different sequences
@@ -975,6 +993,25 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il) const;
+
+    // Gemma 4 MTP: cross-read target KV at il_kv_tgt from SWA or base cache; no KV write.
+    // kv_* describe the **target** cache tensor layout at il_kv_tgt.
+    // When use_k_as_v is true, V tensor is replaced by K (HF Gemma4 assistant full-layer shortcut).
+    ggml_tensor * build_attn_mtp(
+            llm_graph_input_attn_kv_iswa * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * q_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il_mtp,
+             int32_t   il_kv_tgt,
+                   bool   read_from_swa_kv,
+                int64_t   kv_embd_head_v,
+                int64_t   kv_n_head_v,
+                   bool   use_k_as_v) const;
 
     llm_graph_input_attn_cross * build_attn_inp_cross() const;
 

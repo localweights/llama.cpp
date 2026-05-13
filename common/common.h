@@ -156,16 +156,17 @@ enum common_params_sampling_config : uint64_t {
 };
 
 enum common_speculative_type {
-    COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
-    COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
-    COMMON_SPECULATIVE_TYPE_MTP,           // multi-token prediction
-    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
+    COMMON_SPECULATIVE_TYPE_NONE,                // no speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT,               // draft model
+    COMMON_SPECULATIVE_TYPE_EAGLE3,              // eagle draft model
+    COMMON_SPECULATIVE_TYPE_MTP,                 // multi-token prediction (qwen3moe per-slot)
+    COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT,    // Gemma 4 MTP assistant drafter (--mtp-head)
+    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,        // simple self-speculative decoding
+    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,         // self-speculative decoding with n-gram keys only
+    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,       // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
-    COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
+    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,         // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_COUNT                // number of types, unknown type
 };
 
 // Grammar type enumeration
@@ -376,7 +377,15 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    // MTP (Gemma 4 assistant): draft block size B produces B-1 draft tokens per round (default 4)
+    int32_t draft_block_size = 4;
+
     bool has_dft() const {
+        // GEMMA4_ASSISTANT embeds the drafter into the target model via llama_model_load_mtp_from_file;
+        // it does NOT need a separate draft context. Skip draft-model loading for this type.
+        if (type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT) {
+            return false;
+        }
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
     }
 };

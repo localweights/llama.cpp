@@ -792,6 +792,14 @@ struct llama_model_gemma4_assistant : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+// Gemma 4 MTP: target model supplies tok_embd rows + KV; mtp_model supplies assistant weights.
+struct llm_build_gemma4_mtp : public llm_graph_context {
+    const llama_model & target;
+    const llama_model & mtp;
+
+    llm_build_gemma4_mtp(const llama_model & target, const llama_model & mtp_model, const llm_graph_params & params);
+};
+
 
 struct llama_model_gemma_embedding : public llama_model_base {
     llama_model_gemma_embedding(const struct llama_model_params & params) : llama_model_base(params) {}

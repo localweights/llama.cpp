@@ -20,6 +20,15 @@ common_speculative * common_speculative_init(
 
 void common_speculative_free(common_speculative * spec);
 
+// Set target-side sequence id used by gemma4_assistant drafter (reads from target's KV for seq_id).
+// Safe no-op for other implementations.
+void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_id);
+
+// Set the output index in the target's most recent decode whose embeddings should be read
+// as h_prev for the next MTP draft step. -1 means "last output" (default).
+// Safe no-op for non-gemma4_assistant implementations.
+void common_speculative_set_h_idx(common_speculative * spec, int batch_idx);
+
 // optionally call once at the beginning of a new generation.
 // last_row: row index in the trunk's last t_h_pre_norm tensor for this slot's last prefill token.
 // Pass -1 (default) for single-slot case (uses last row automatically).

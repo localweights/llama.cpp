@@ -103,6 +103,24 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_mtp::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch && ubatch->n_tokens == 1);
+    GGML_ASSERT(ubatch->token && ubatch->embd);
+    GGML_ASSERT(inp_last_token && inp_h_prev);
+
+    ggml_backend_tensor_set(inp_last_token, ubatch->token, 0, sizeof(llama_token));
+
+    const int64_t n_bb = inp_h_prev->ne[0];
+    ggml_backend_tensor_set(inp_h_prev, ubatch->embd, 0, n_bb * sizeof(float));
+}
+
+bool llm_graph_input_mtp::can_reuse(const llm_graph_params & params) {
+    if (params.gtype != LLM_GRAPH_TYPE_MTP) {
+        return false;
+    }
+    return inp_last_token && inp_last_token->ne[0] == 1 && inp_h_prev && inp_h_prev->ne[1] == 1;
+}
+
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -501,29 +519,39 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
-    mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
+    // MTP / split graphs may omit K/V idx inputs from the scheduled subgraph; alloc leaves buffer unset.
+    // Only fill tensors that were materialized.
+    if (self_k_idxs && self_k_idxs->buffer) {
+        mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
+    }
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
+    }
 
     mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
-    mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
-    mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
+    if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
+        mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
+    }
+    if (self_v_idxs_swa && self_v_idxs_swa->buffer) {
+        mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
+    }
 
     mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
 
-    if (self_k_rot) {
+    if (self_k_rot && self_k_rot->buffer) {
         mctx->get_base()->set_input_k_rot(self_k_rot);
     }
 
-    if (self_v_rot) {
+    if (self_v_rot && self_v_rot->buffer) {
         mctx->get_base()->set_input_v_rot(self_v_rot);
     }
 
-    if (self_k_rot_swa) {
+    if (self_k_rot_swa && self_k_rot_swa->buffer) {
         mctx->get_swa()->set_input_k_rot(self_k_rot_swa);
     }
 
-    if (self_v_rot_swa) {
+    if (self_v_rot_swa && self_v_rot_swa->buffer) {
         mctx->get_swa()->set_input_v_rot(self_v_rot_swa);
     }
 }
@@ -2429,6 +2457,57 @@ ggml_tensor * llm_graph_context::build_attn(
         //cb(cur, "kqv_wo", il);
     }
 
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_attn_mtp(
+        llm_graph_input_attn_kv_iswa * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * q_cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+            float     kq_scale,
+            int       il_mtp,
+        int32_t     il_kv_tgt,
+            bool     read_from_swa_kv,
+        int64_t     kv_embd_head_v,
+        int64_t     kv_n_head_v,
+            bool     use_k_as_v) const {
+    auto * k_rot = read_from_swa_kv ? inp->self_k_rot_swa : inp->self_k_rot;
+    auto * v_rot = read_from_swa_kv ? inp->self_v_rot_swa : inp->self_v_rot;
+
+    if (k_rot) {
+        q_cur = ggml_mul_mat_aux(ctx0, q_cur, k_rot);
+    }
+
+    ggml_build_forward_expand(gf, q_cur);
+
+    const auto * mctx_iswa = inp->mctx;
+    const auto * mctx_cur  = read_from_swa_kv ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+
+    const auto & kq_mask = read_from_swa_kv ? inp->get_kq_mask_swa() : inp->get_kq_mask();
+
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il_kv_tgt);
+    ggml_tensor * v = use_k_as_v ? k : mctx_cur->get_v(ctx0, il_kv_tgt);
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il_mtp);
+    cb(cur, "kqv_out_mtp", il_mtp);
+
+    if (v_rot) {
+        cur = ggml_mul_mat_aux(ctx0, cur, v_rot);
+    }
+
+    if (wo) {
+        cur = build_lora_mm(wo, cur);
+        cb(cur, "mtp_wo_out", il_mtp);
+    }
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }

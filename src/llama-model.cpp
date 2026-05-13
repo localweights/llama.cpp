@@ -2078,7 +2078,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 }
 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
-    std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
+    std::unique_ptr<llm_graph_context> llm;
+    if (params.gtype == LLM_GRAPH_TYPE_MTP && mtp_assistant) {
+        // Gemma 4 MTP: build the draft graph using target model (this) + assistant weights.
+        llm = std::make_unique<llm_build_gemma4_mtp>(*this, *mtp_assistant, params);
+    } else {
+        llm = build_arch_graph(params);
+    }
 
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);

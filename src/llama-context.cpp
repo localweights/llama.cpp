@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -1422,8 +1423,8 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx && !mctx->apply()) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool apply_mctx) {
+    if (apply_mctx && mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
@@ -1434,7 +1435,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const llm_graph_params gparams = gtype == LLM_GRAPH_TYPE_MTP
+        ? graph_params_mtp(res, ubatch, mctx)
+        : graph_params(res, ubatch, mctx, gtype);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -2438,6 +2441,182 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+}
+
+llm_graph_params llama_context::graph_params_mtp(
+        llm_graph_result * res,
+        const llama_ubatch & ubatch,
+        const llama_memory_context_i * mctx) const {
+    const llama_model * mtp = model.mtp_assistant.get();
+    GGML_ASSERT(mtp && "graph_params_mtp called without mtp_assistant loaded");
+
+    return {
+        /*.arch        =*/ mtp->arch,
+        /*.hparams     =*/ mtp->hparams,
+        /*.cparams     =*/ cparams,
+        /*.ubatch      =*/ ubatch,
+        /*.gtype       =*/ LLM_GRAPH_TYPE_MTP,
+        /*.sched       =*/ sched.get(),
+        /*.backend_cpu =*/ backend_cpu,
+        /*.cvec        =*/ cvec.get(),
+        /*.loras       =*/ loras.get(),
+        /*.mctx        =*/ mctx,
+        /*.cross       =*/ &cross,
+        /*.samplers    =*/ sampling.samplers,
+        /*.n_outputs   =*/ n_outputs,
+        /*.cb          =*/ graph_get_cb(),
+        /*.res         =*/ res,
+    };
+}
+
+int32_t llama_context::decode_mtp(
+        llama_seq_id seq_id,
+        llama_pos    attn_pos,
+        llama_token  last_token,
+        float      * h_prev,
+        int32_t      n_steps,
+        llama_token * out_drafts,
+        float       * out_logits,
+        float       * out_h_prev_last) {
+    if (!model.mtp_assistant) {
+        LLAMA_LOG_ERROR("%s: no MTP assistant loaded (use llama_model_load_mtp_from_file)\n", __func__);
+        return -1;
+    }
+    if (!memory) {
+        LLAMA_LOG_ERROR("%s: context has no KV memory\n", __func__);
+        return -2;
+    }
+    auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
+    if (!kv_iswa) {
+        LLAMA_LOG_ERROR("%s: MTP requires llama_kv_cache_iswa memory (Gemma 4 target)\n", __func__);
+        return -3;
+    }
+
+    const int32_t  n_vocab = (int32_t) model.vocab.n_tokens();
+    const uint32_t n_bb    = model.mtp_assistant->hparams.n_embd_backbone;
+    if (n_bb == 0) {
+        LLAMA_LOG_ERROR("%s: assistant missing n_embd_backbone metadata\n", __func__);
+        return -4;
+    }
+
+    // Build a 1-token ubatch shared by all steps
+    auto data = std::make_shared<llama_ubatch::data_t>();
+    data->token.resize(1);
+    data->embd.resize(n_bb);
+    data->pos.resize(1);
+    data->n_seq_id.resize(1);
+    data->seq_id.resize(1);
+    data->seq_id_data.resize(1);
+    data->output.resize(1);
+    data->seq_idx.resize(LLAMA_MAX_SEQ, -1);
+    data->seq_id_unq.push_back(seq_id);
+    data->seq_idx[(size_t) seq_id] = 0;
+
+    llama_ubatch ub{};
+    ub.b_equal_seqs = 1;
+    ub.n_tokens     = 1;
+    ub.n_seq_tokens = 1;
+    ub.n_seqs       = 1;
+    ub.n_seqs_unq   = 1;
+    ub.n_pos        = 1;
+    ub.token        = data->token.data();
+    ub.embd         = data->embd.data();
+    ub.pos          = data->pos.data();
+    ub.n_seq_id     = data->n_seq_id.data();
+    ub.seq_id       = data->seq_id.data();
+    ub.seq_id_unq   = data->seq_id_unq.data();
+    ub.seq_idx      = data->seq_idx.data();
+    ub.output       = data->output.data();
+    ub.data         = data;
+
+    data->n_seq_id[0]    = 1;
+    data->seq_id_data[0] = seq_id;
+    data->seq_id[0]      = &data->seq_id_data[0];
+    data->output[0]      = 1; // need logits output
+
+    llama_token cur_tok = last_token;
+    std::vector<float> hbuf(n_bb);
+    std::memcpy(hbuf.data(), h_prev, n_bb * sizeof(float));
+
+    const int64_t save_n_outputs = n_outputs;
+    n_outputs = 1;
+
+    // We need a memory context for ISWA attention mask/idx building but must NOT advance
+    // the KV write cursor (drafter reads-only from target KV, never writes).
+    // We reuse the target context's KV; create a read-only memory context.
+    // The simplest approach: pass nullptr mctx and call process_ubatch with apply_mctx=false.
+    // The drafter graph uses build_attn_mtp which fetches K/V directly by layer index.
+
+    int32_t rc = 0;
+    for (int step = 0; step < n_steps; ++step) {
+        data->token[0] = cur_tok;
+        data->pos[0]   = attn_pos + 1 + (llama_pos) step;
+        std::memcpy(data->embd.data(), hbuf.data(), n_bb * sizeof(float));
+
+        // Create a read-only memory context for the ISWA KV.
+        // init_full() provides mask/index buffers without advancing the write cursor.
+        auto mctx_up = kv_iswa->init_full();
+        if (!mctx_up) {
+            LLAMA_LOG_ERROR("%s: kv_iswa->init_full failed at step %d\n", __func__, step);
+            rc = -10;
+            break;
+        }
+
+        ggml_status st = GGML_STATUS_SUCCESS;
+        // apply_mctx=true: fills attention masks/k_idxs from current KV state for seq_id.
+        // The drafter graph uses build_attn_mtp which reads K/V by layer index, no new writes.
+        auto * res = process_ubatch(ub, LLM_GRAPH_TYPE_MTP, mctx_up.get(), st, true);
+        if (!res || st != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: process_ubatch failed at step %d (st=%d)\n", __func__, step, (int) st);
+            rc = -11;
+            break;
+        }
+
+        // Synchronize to get logits
+        ggml_backend_sched_synchronize(sched.get());
+
+        // Sample greedy from logits
+        if (!res->t_logits) {
+            LLAMA_LOG_ERROR("%s: no logits tensor at step %d\n", __func__, step);
+            rc = -12;
+            break;
+        }
+
+        std::vector<float> logits_buf((size_t) n_vocab);
+        ggml_backend_tensor_get(res->t_logits, logits_buf.data(), 0, (size_t) n_vocab * sizeof(float));
+
+        if (out_logits) {
+            std::memcpy(out_logits + (size_t) step * n_vocab, logits_buf.data(), (size_t) n_vocab * sizeof(float));
+        }
+
+        // Greedy argmax
+        llama_token best = 0;
+        float best_l = logits_buf[0];
+        for (int32_t i = 1; i < n_vocab; ++i) {
+            if (logits_buf[i] > best_l) {
+                best_l = logits_buf[i];
+                best = (llama_token) i;
+            }
+        }
+        if (out_drafts) {
+            out_drafts[step] = best;
+        }
+        cur_tok = best;
+
+        // Extract post-projection hidden for next step
+        if (res->t_embd) {
+            GGML_ASSERT((size_t) res->t_embd->ne[0] == (size_t) n_bb);
+            ggml_backend_tensor_get(res->t_embd, hbuf.data(), 0, n_bb * sizeof(float));
+        }
+    }
+
+    n_outputs = save_n_outputs;
+
+    if (rc == 0 && out_h_prev_last) {
+        std::memcpy(out_h_prev_last, hbuf.data(), n_bb * sizeof(float));
+    }
+
+    return rc;
 }
 
 ggml_status llama_context::graph_compute(
@@ -4268,6 +4447,24 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+int32_t llama_decode_mtp(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_pos attn_pos,
+        llama_token last_token,
+        float * h_prev,
+        int32_t n_steps,
+        llama_token * out_drafts,
+        float * out_logits,
+        float * out_h_prev_last) {
+    if (!ctx) {
+        LLAMA_LOG_ERROR("%s: ctx is NULL\n", __func__);
+        return -1;
+    }
+    return ctx->decode_mtp(seq_id, attn_pos, last_token, h_prev, n_steps,
+                           out_drafts, out_logits, out_h_prev_last);
 }
 
 //

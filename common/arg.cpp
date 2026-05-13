@@ -3561,6 +3561,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
+        {"--mtp-head"}, "FNAME",
+        "Gemma 4 MTP: path to gemma4_assistant GGUF (use with --spec-type gemma4_assistant)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mparams.path = value;
+            // Auto-select gemma4_assistant if no spec-type was explicitly set yet
+            if (params.speculative.type == COMMON_SPECULATIVE_TYPE_NONE) {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT;
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_MTP_HEAD"));
+    add_opt(common_arg(
         {"--spec-draft-replace", "--spec-replace"}, "TARGET", "DRAFT",
         "translate the string in TARGET into DRAFT if the draft model and main model are not compatible",
         [](common_params & params, const std::string & tgt, const std::string & dft) {
@@ -3568,14 +3579,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-type"}, "[none|mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
-        string_format("type of speculative decoding to use when no draft model is provided (default: %s)\n",
+        {"--spec-type"}, "[none|mtp|gemma4_assistant|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
+        string_format("type of speculative decoding (default: %s). For Gemma 4 MTP use --spec-type gemma4_assistant and --mtp-head pointing at gemma4_assistant GGUF.\n",
             common_speculative_type_to_str(params.speculative.type).c_str()),
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
             } else if (value == "mtp") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
+            } else if (value == "gemma4_assistant") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT;
             } else if (value == "ngram-cache") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
             } else if (value == "ngram-simple") {
@@ -3587,10 +3600,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else if (value == "ngram-mod") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
             } else {
-                throw std::invalid_argument("unknown speculative decoding type without draft model");
+                throw std::invalid_argument("unknown speculative decoding type");
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
+    add_opt(common_arg(
+        {"--draft-block-size"}, "N",
+        string_format("Gemma 4 MTP draft block size B (drafts B-1 tokens per round; default: %d)", params.speculative.draft_block_size),
+        [](common_params & params, int value) {
+            if (value < 2 || value > 32) {
+                throw std::invalid_argument("draft block size must be between 2 and 32");
+            }
+            params.speculative.draft_block_size = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_BLOCK_SIZE"));
     add_opt(common_arg(
         {"--spec-tree-branching"}, "N",
         string_format("EAGLE-2 tree drafting: top-K candidates per MTP step (default: %d, 1 = linear AR chain)", params.speculative.mtp.tree_branching),
