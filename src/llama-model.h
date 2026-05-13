@@ -543,6 +543,12 @@ struct llama_model {
     struct ggml_tensor * conv1d   = nullptr;
     struct ggml_tensor * conv1d_b = nullptr;
 
+    // gemma4_assistant MTP projection weights
+    struct ggml_tensor * mtp_pre_projection  = nullptr;
+    struct ggml_tensor * mtp_post_projection = nullptr;
+    struct ggml_tensor * mtp_centroids       = nullptr;
+    struct ggml_tensor * mtp_token_ordering  = nullptr;
+
     // gemma3n altup
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;

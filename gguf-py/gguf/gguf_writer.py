@@ -807,6 +807,25 @@ class GGUFWriter:
         else:
             self.add_array(key, value)
 
+    # gemma4_assistant MTP speculative drafter metadata
+    def add_n_centroids(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.N_CENTROIDS.format(arch=self.arch), value)
+
+    def add_centroid_top_k(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.CENTROID_TOP_K.format(arch=self.arch), value)
+
+    def add_n_embd_backbone(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.N_EMBD_BACKBONE.format(arch=self.arch), value)
+
+    def add_use_ordered_embeddings(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.USE_ORDERED_EMBEDDINGS.format(arch=self.arch), value)
+
+    def add_attention_k_eq_v(self, value: bool) -> None:
+        self.add_bool(Keys.Attention.K_EQ_V.format(arch=self.arch), value)
+
+    def add_requires_target_arch(self, value: str) -> None:
+        self.add_string(Keys.LLM.REQUIRES_TARGET_ARCH.format(arch=self.arch), value)
+
     def add_dense_features_dims(self, dense:str, in_f:int, out_f:int) -> None:
         self.add_uint32(Keys.LLM.DENSE_FEAT_IN_SIZE.format(arch=self.arch, dense=dense), in_f)
         self.add_uint32(Keys.LLM.DENSE_FEAT_OUT_SIZE.format(arch=self.arch, dense=dense), out_f)
