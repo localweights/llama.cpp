@@ -59,7 +59,9 @@ void llama_model_qwen3moe_assistant::load_arch_tensors(llama_model_loader &) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
     }
 
-    int rope_freqs_flag = 0;
+    // RoPE freqs are optional for Qwen3 NEOX path — let llama.cpp compute them
+    // from rope.freq_base if the GGUF doesn't ship a precomputed tensor.
+    int rope_freqs_flag = TENSOR_NOT_REQUIRED;
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
