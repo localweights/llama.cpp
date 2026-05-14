@@ -1675,7 +1675,13 @@ common_speculative * common_speculative_init(
             // Load assistant into target model (non-const cast: we own the target model)
             llama_model * model_tgt_mut = const_cast<llama_model *>(model_tgt);
             llama_model_params mtp_mparams = llama_model_default_params();
-            mtp_mparams.n_gpu_layers = 0; // CPU only for the assistant
+            // Offload assistant to GPU. Drafter is tiny (~470 MiB for the
+            // gemma-4-31b head) but its forward pass runs once per decode
+            // iteration; on CPU it dominates spec-decode wall time. Use the
+            // user-supplied draft override if present, else max-offload.
+            mtp_mparams.n_gpu_layers = params.draft.n_gpu_layers > 0
+                ? params.draft.n_gpu_layers
+                : 999;
             const int rc = llama_model_load_mtp_from_file(model_tgt_mut, params.draft.mparams.path.c_str(), mtp_mparams);
             if (rc != 0) {
                 LOG_ERR("%s: llama_model_load_mtp_from_file failed (rc=%d)\n", __func__, rc);
