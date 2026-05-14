@@ -2542,12 +2542,24 @@ int32_t llama_context::decode_mtp(
     // The simplest approach: pass nullptr mctx and call process_ubatch with apply_mctx=false.
     // The drafter graph uses build_attn_mtp which fetches K/V directly by layer index.
 
-    // Force-disable flash attention for the drafter graph. Some assistants
-    // (gemma-4-e4b) have attention head shapes (e.g. head_dim=512) that
-    // ggml_cuda_flash_attn_ext does not support and aborts in fattn.cu:109.
-    // The target's flash_attn setting is restored after the loop.
+    // Some assistants (gemma-4-e4b) have attention head shapes (head_dim=512)
+    // that ggml_cuda_flash_attn_ext does not support and aborts in
+    // fattn.cu:109. We disable flash attention for those drafters only.
+    //
+    // For assistants with supported head dims (gemma-4-31b: head_dim=256),
+    // disabling FA forces a fallback attention path that on q8/q8 KV emits a
+    // q8_0 → q8_0 copy op which ggml_cuda_cpy does NOT support either —
+    // crashes at cpy.cu:550. So we MUST keep FA on for those.
+    //
+    // Gate on assistant n_embd_head_k: <= 256 → FA on (CUDA supports it),
+    // > 256 → FA off (CUDA FA unsupported, accept the q8 copy cost via a
+    // copy-friendly KV setup; in practice e4b runs with f16 KV).
     const bool saved_flash_attn = cparams.flash_attn;
-    cparams.flash_attn = false;
+    const uint32_t mtp_head_k   = model.mtp_assistant->hparams.n_embd_head_k(0);
+    const bool disable_fa_mtp   = (mtp_head_k > 256);
+    if (disable_fa_mtp) {
+        cparams.flash_attn = false;
+    }
 
     int32_t rc = 0;
     for (int step = 0; step < n_steps; ++step) {
