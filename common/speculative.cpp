@@ -1145,9 +1145,12 @@ struct common_speculative_state_gemma4_assistant : public common_speculative_sta
         llama_set_embeddings(ctx_tgt, true);
     }
 
-    void begin(const llama_tokens & prompt, int32_t /*last_row*/ = -1) override {
+    void begin(const llama_tokens & prompt, int32_t last_row = -1) override {
         GGML_UNUSED(prompt);
         llama_set_embeddings(ctx_tgt, true);
+        // Stash the prefill's last-output row so the first draft() call after
+        // prompt eval reads h_prev from the correct embeddings_ith slot.
+        h_idx = last_row;
     }
 
     void draft(
@@ -1231,8 +1234,12 @@ struct common_speculative_state_gemma4_assistant : public common_speculative_sta
         prev_n_acc_drafts = n_acc_drafts;
     }
 
-    void accept(uint16_t n_accepted, int32_t /*last_accepted_row*/ = -1) override {
+    void accept(uint16_t n_accepted, int32_t last_accepted_row = -1) override {
         n_acc_drafts += n_accepted;
+        // Plumb h_idx for the next draft() call. The server passes the
+        // embeddings_ith row of the last accepted token in the trunk decode.
+        // -1 falls back to llama_get_embeddings_ith's "last output" default.
+        h_idx = last_accepted_row;
     }
 
     int32_t n_max(const common_params_speculative & params) const override {
