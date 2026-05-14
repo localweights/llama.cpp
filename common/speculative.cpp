@@ -1190,21 +1190,6 @@ struct common_speculative_state_gemma4_assistant : public common_speculative_sta
             return;
         }
 
-        // TODO[#111]: second decode_mtp invocation on the same context (after a
-        // DECODER ↔ MTP graph swap on the shared sched) segfaults inside
-        // process_ubatch's graph_compute. First invocation works end-to-end
-        // with high accept rate; the bug is in sched/buffer reuse across graph
-        // types. Until that's fixed, cap drafter at one invocation per slot
-        // generation so the slot serves coherently. Set env
-        // LLAMA_GEMMA4_DRAFT_UNCAP=1 to disable this guard for debugging.
-        static const bool uncap = [](){
-            const char * s = std::getenv("LLAMA_GEMMA4_DRAFT_UNCAP");
-            return s && atoi(s) != 0;
-        }();
-        if (!uncap && n_call_draft >= 1) {
-            return;
-        }
-
         // Read h_prev from target's t_h_pre_norm tap (set by gemma4.cpp).
         // Graph-output tensor; populated regardless of cparams.embeddings,
         // so it survives server's per-decode toggling of that flag.

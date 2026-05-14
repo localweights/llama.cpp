@@ -2563,9 +2563,12 @@ int32_t llama_context::decode_mtp(
         }
 
         ggml_status st = GGML_STATUS_SUCCESS;
-        // apply_mctx=true: fills attention masks/k_idxs from current KV state for seq_id.
-        // The drafter graph uses build_attn_mtp which reads K/V by layer index, no new writes.
-        auto * res = process_ubatch(ub, LLM_GRAPH_TYPE_MTP, mctx_up.get(), st, true);
+        // apply_mctx=false: init_full()'s mctx has empty ubatches and a null
+        // lctx, so kv->update() inside mctx->apply() can null-deref on the
+        // second invocation when KV state has been mutated by main decodes in
+        // between (#111). The graph uses build_attn_mtp which fetches K/V by
+        // layer index directly from the cache — no mctx-applied masks needed.
+        auto * res = process_ubatch(ub, LLM_GRAPH_TYPE_MTP, mctx_up.get(), st, false);
         if (!res || st != GGML_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: process_ubatch failed at step %d (st=%d)\n", __func__, step, (int) st);
             rc = -11;
