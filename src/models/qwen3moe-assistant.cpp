@@ -59,10 +59,6 @@ void llama_model_qwen3moe_assistant::load_arch_tensors(llama_model_loader &) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
     }
 
-    // RoPE freqs are optional for Qwen3 NEOX path — let llama.cpp compute them
-    // from rope.freq_base if the GGUF doesn't ship a precomputed tensor.
-    int rope_freqs_flag = TENSOR_NOT_REQUIRED;
-
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
         const int64_t n_head_i      = hparams.n_head(i);
@@ -85,10 +81,8 @@ void llama_model_qwen3moe_assistant::load_arch_tensors(llama_model_loader &) {
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd},   0);
 
-        if (!hparams.is_swa(i)) {
-            layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_embd_head_i / 2}, rope_freqs_flag);
-            rope_freqs_flag  = TENSOR_DUPLICATED;
-        }
+        // No precomputed rope_freqs tensor — Qwen3 NEOX RoPE builds freqs
+        // on-the-fly from rope.freq_base inside the graph (ggml_rope_ext).
     }
 }
 
@@ -175,10 +169,8 @@ llm_build_qwen3moe_mtp::llm_build_qwen3moe_mtp(
         cur = build_norm(inpL, mtp.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
+        // No precomputed rope_freqs — let ggml_rope_ext compute from freq_base.
         ggml_tensor * freq_factors = nullptr;
-        if (!hparams.is_swa(il)) {
-            freq_factors = mtp.layers[il].rope_freqs;
-        }
 
         ggml_tensor * Qcur = build_lora_mm(mtp.layers[il].wq, cur);
         cb(Qcur, "Qcur", il);
