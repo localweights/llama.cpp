@@ -161,6 +161,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_EAGLE3,              // eagle draft model
     COMMON_SPECULATIVE_TYPE_MTP,                 // multi-token prediction (qwen3moe per-slot)
     COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT,    // Gemma 4 MTP assistant drafter (--mtp-head)
+    COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT,     // Qwen3MoE Eagle drafter (--mtp-head, shares gemma4_assistant impl)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,        // simple self-speculative decoding
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,         // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,       // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -381,9 +382,11 @@ struct common_params_speculative {
     int32_t draft_block_size = 4;
 
     bool has_dft() const {
-        // GEMMA4_ASSISTANT embeds the drafter into the target model via llama_model_load_mtp_from_file;
-        // it does NOT need a separate draft context. Skip draft-model loading for this type.
-        if (type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT) {
+        // GEMMA4_ASSISTANT / QWEN3_ASSISTANT embed the drafter into the target model via
+        // llama_model_load_mtp_from_file; they do NOT need a separate draft context.
+        // Skip draft-model loading for these types.
+        if (type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT ||
+            type == COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT) {
             return false;
         }
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();

@@ -3579,8 +3579,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-type"}, "[none|mtp|gemma4_assistant|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
-        string_format("type of speculative decoding (default: %s). For Gemma 4 MTP use --spec-type gemma4_assistant and --mtp-head pointing at gemma4_assistant GGUF.\n",
+        {"--spec-type"}, "[none|mtp|gemma4_assistant|qwen3_assistant|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
+        string_format("type of speculative decoding (default: %s). For Gemma 4 MTP use --spec-type gemma4_assistant and --mtp-head pointing at gemma4_assistant GGUF.\n"
+            "For Qwen3 MTP use --spec-type qwen3_assistant and --mtp-head pointing at qwen3_assistant GGUF.\n",
             common_speculative_type_to_str(params.speculative.type).c_str()),
         [](common_params & params, const std::string & value) {
             if (value == "none") {
@@ -3589,6 +3590,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
             } else if (value == "gemma4_assistant") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT;
+            } else if (value == "qwen3_assistant") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT;
             } else if (value == "ngram-cache") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
             } else if (value == "ngram-simple") {

@@ -27,6 +27,7 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_EAGLE3,
     COMMON_SPECULATIVE_TYPE_MTP,
     COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT,
+    COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT,
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
@@ -40,6 +41,7 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"eagle3",             COMMON_SPECULATIVE_TYPE_EAGLE3},
     {"mtp",                COMMON_SPECULATIVE_TYPE_MTP},
     {"gemma4_assistant",   COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT},
+    {"qwen3_assistant",    COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT},
     {"ngram_simple",       COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram_map_k",        COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram_map_k4v",      COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -1664,11 +1666,12 @@ common_speculative * common_speculative_init(
     }
 
     // Gemma 4 MTP assistant: load the drafter GGUF into the target model if needed.
-    if (params.type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT) {
+    if (params.type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT ||
+        params.type == COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT) {
         const llama_model * model_tgt = llama_get_model(ctx_tgt);
         if (!llama_model_has_mtp_assistant(model_tgt)) {
             if (params.draft.mparams.path.empty()) {
-                LOG_ERR("%s: --spec-type gemma4_assistant requires --mtp-head (or --model-draft) pointing at the assistant GGUF\n", __func__);
+                LOG_ERR("%s: --spec-type {gemma4_assistant,qwen3_assistant} requires --mtp-head (or --model-draft) pointing at the assistant GGUF\n", __func__);
                 if (ctx_dft) { llama_free(ctx_dft); }
                 return nullptr;
             }
@@ -1705,6 +1708,8 @@ common_speculative * common_speculative_init(
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
         bool has_mtp = (params.type == COMMON_SPECULATIVE_TYPE_MTP) && (ctx_mtp != nullptr);
         bool has_gemma4_assistant = (params.type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT)
+            && llama_model_has_mtp_assistant(llama_get_model(ctx_tgt));
+        bool has_qwen3_assistant = (params.type == COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT)
             && llama_model_has_mtp_assistant(llama_get_model(ctx_tgt));
 
         bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
@@ -1758,6 +1763,10 @@ common_speculative * common_speculative_init(
         if (has_gemma4_assistant) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT, params));
         }
+        if (has_qwen3_assistant) {
+            // Qwen3 assistant uses the same implementation as Gemma4 assistant
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT, params));
+        }
     }
 
     std::vector<std::unique_ptr<common_speculative_state>> impls = {};
@@ -1787,7 +1796,8 @@ common_speculative * common_speculative_init(
                     config.type, ctx_tgt, ctx_mtp, params.mtp.seq_id));
                 break;
             }
-            case COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT: {
+            case COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT:
+            case COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT: {
                 impls.push_back(std::make_unique<common_speculative_state_gemma4_assistant>(
                     config.type, ctx_tgt));
                 break;
