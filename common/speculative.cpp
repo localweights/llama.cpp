@@ -1192,11 +1192,39 @@ struct common_speculative_state_gemma4_assistant : public common_speculative_sta
 
         std::vector<float> h_prev((size_t) n_bb, 0.0f);
         bool h_valid = false;
-        if (float * h_tgt = llama_get_embeddings_ith(ctx_tgt, h_idx)) {
-            const int32_t n_out = llama_model_n_embd_out(model_tgt);
-            const int32_t n_copy = std::min(n_bb, n_out);
-            std::memcpy(h_prev.data(), h_tgt, (size_t) n_copy * sizeof(float));
+        // h_idx is the *already-resolved output row* (see common_speculative_begin /
+        // common_speculative_accept call sites in server-context.cpp, which pass the
+        // result of llama_context_get_output_row()). Going through llama_get_embeddings_ith
+        // would re-resolve it as a batch-token index and fail. Read the embeddings
+        // buffer directly at row offset instead. Fall back to "last output row"
+        // via embeddings_ith(-1) when h_idx is unset (first turn before begin()).
+        const int32_t n_out = llama_model_n_embd_out(model_tgt);
+        const int32_t n_copy = std::min(n_bb, n_out);
+        // Two read paths:
+        //  - h_idx >= 0: server passed an already-resolved output row. Read the
+        //    embeddings buffer directly at that offset; going through
+        //    llama_get_embeddings_ith would re-resolve as a batch-token index.
+        //  - h_idx < 0 (first turn, before begin() set anything): fall back to
+        //    "last output row" via embeddings_ith(-1).
+        //
+        // NOTE: llama-server toggles cparams.embeddings per-decode via
+        // slot_batched->need_embd() (server-context.cpp:3367). For chat slots
+        // need_embd() is false, so the embeddings buffer is never allocated
+        // (llama_get_embeddings returns nullptr) and h_valid stays false →
+        // drafter early-exits. Proper fix is to tap t_h_pre_norm in the
+        // gemma3 target graph (mirroring qwen3moe.cpp:209) and read it via
+        // llama_context_get_t_h_pre_norm() — see TODO[#111-gemma4-tap].
+        float * h_base = llama_get_embeddings(ctx_tgt);
+        if (h_idx >= 0 && h_base) {
+            std::memcpy(h_prev.data(),
+                        h_base + (size_t) h_idx * (size_t) n_out,
+                        (size_t) n_copy * sizeof(float));
             h_valid = true;
+        } else {
+            if (float * h_tgt = llama_get_embeddings_ith(ctx_tgt, -1)) {
+                std::memcpy(h_prev.data(), h_tgt, (size_t) n_copy * sizeof(float));
+                h_valid = true;
+            }
         }
         // Skip drafter when target's last hidden state is unavailable (e.g.
         // first turn before h_idx is wired, or batch produced no embeddings).
