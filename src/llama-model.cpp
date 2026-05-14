@@ -136,6 +136,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_gemma4(params);
         case LLM_ARCH_GEMMA4_ASSISTANT:
             return new llama_model_gemma4_assistant(params);
+        case LLM_ARCH_QWEN3MOE_ASSISTANT:
+            return new llama_model_qwen3moe_assistant(params);
         case LLM_ARCH_GEMMA_EMBEDDING:
             return new llama_model_gemma_embedding(params);
         case LLM_ARCH_STARCODER2:
