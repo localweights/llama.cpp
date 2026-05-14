@@ -1141,16 +1141,18 @@ struct common_speculative_state_gemma4_assistant : public common_speculative_sta
 
     explicit common_speculative_state_gemma4_assistant(enum common_speculative_type type,
                                                        llama_context * ctx_tgt)
-        : common_speculative_state(type), ctx_tgt(ctx_tgt) {
-        llama_set_embeddings(ctx_tgt, true);
-    }
+        : common_speculative_state(type), ctx_tgt(ctx_tgt) {}
 
     void begin(const llama_tokens & prompt, int32_t last_row = -1) override {
         GGML_UNUSED(prompt);
-        llama_set_embeddings(ctx_tgt, true);
-        // Stash the prefill's last-output row so the first draft() call after
-        // prompt eval reads h_prev from the correct embeddings_ith slot.
         h_idx = last_row;
+        // Reset per-generation counters so the #111 single-shot cap (see
+        // draft()) re-arms for each new request rather than firing once per
+        // slot lifetime.
+        n_call_draft       = 0;
+        n_acc_drafts       = 0;
+        prev_n_acc_drafts  = 0;
+        zero_accept_streak = 0;
     }
 
     void draft(
@@ -1188,41 +1190,40 @@ struct common_speculative_state_gemma4_assistant : public common_speculative_sta
             return;
         }
 
-        llama_set_embeddings(ctx_tgt, true);
+        // TODO[#111]: second decode_mtp invocation on the same context (after a
+        // DECODER ↔ MTP graph swap on the shared sched) segfaults inside
+        // process_ubatch's graph_compute. First invocation works end-to-end
+        // with high accept rate; the bug is in sched/buffer reuse across graph
+        // types. Until that's fixed, cap drafter at one invocation per slot
+        // generation so the slot serves coherently. Set env
+        // LLAMA_GEMMA4_DRAFT_UNCAP=1 to disable this guard for debugging.
+        static const bool uncap = [](){
+            const char * s = std::getenv("LLAMA_GEMMA4_DRAFT_UNCAP");
+            return s && atoi(s) != 0;
+        }();
+        if (!uncap && n_call_draft >= 1) {
+            return;
+        }
 
+        // Read h_prev from target's t_h_pre_norm tap (set by gemma4.cpp).
+        // Graph-output tensor; populated regardless of cparams.embeddings,
+        // so it survives server's per-decode toggling of that flag.
+        // h_idx is the already-resolved output row (server passes the result
+        // of llama_context_get_output_row()).
         std::vector<float> h_prev((size_t) n_bb, 0.0f);
         bool h_valid = false;
-        // h_idx is the *already-resolved output row* (see common_speculative_begin /
-        // common_speculative_accept call sites in server-context.cpp, which pass the
-        // result of llama_context_get_output_row()). Going through llama_get_embeddings_ith
-        // would re-resolve it as a batch-token index and fail. Read the embeddings
-        // buffer directly at row offset instead. Fall back to "last output row"
-        // via embeddings_ith(-1) when h_idx is unset (first turn before begin()).
         const int32_t n_out = llama_model_n_embd_out(model_tgt);
         const int32_t n_copy = std::min(n_bb, n_out);
-        // Two read paths:
-        //  - h_idx >= 0: server passed an already-resolved output row. Read the
-        //    embeddings buffer directly at that offset; going through
-        //    llama_get_embeddings_ith would re-resolve as a batch-token index.
-        //  - h_idx < 0 (first turn, before begin() set anything): fall back to
-        //    "last output row" via embeddings_ith(-1).
-        //
-        // NOTE: llama-server toggles cparams.embeddings per-decode via
-        // slot_batched->need_embd() (server-context.cpp:3367). For chat slots
-        // need_embd() is false, so the embeddings buffer is never allocated
-        // (llama_get_embeddings returns nullptr) and h_valid stays false →
-        // drafter early-exits. Proper fix is to tap t_h_pre_norm in the
-        // gemma3 target graph (mirroring qwen3moe.cpp:209) and read it via
-        // llama_context_get_t_h_pre_norm() — see TODO[#111-gemma4-tap].
-        float * h_base = llama_get_embeddings(ctx_tgt);
-        if (h_idx >= 0 && h_base) {
-            std::memcpy(h_prev.data(),
-                        h_base + (size_t) h_idx * (size_t) n_out,
-                        (size_t) n_copy * sizeof(float));
-            h_valid = true;
-        } else {
-            if (float * h_tgt = llama_get_embeddings_ith(ctx_tgt, -1)) {
-                std::memcpy(h_prev.data(), h_tgt, (size_t) n_copy * sizeof(float));
+        ggml_tensor * src = llama_context_get_t_h_pre_norm(ctx_tgt);
+        if (src) {
+            const int32_t n_rows = (int32_t) src->ne[1];
+            const int32_t row = (h_idx >= 0 && h_idx < n_rows) ? h_idx : n_rows - 1;
+            if (row >= 0) {
+                const size_t row_bytes = (size_t) n_out * sizeof(float);
+                llama_synchronize(ctx_tgt);
+                ggml_backend_tensor_get(src, h_prev.data(),
+                                        (size_t) row * row_bytes,
+                                        (size_t) n_copy * sizeof(float));
                 h_valid = true;
             }
         }

@@ -839,6 +839,12 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    // Clear t_h_pre_norm too. The previous graph's ctx_compute is reset (see
+    // below) and all its tensors freed, so a stale t_h_pre_norm pointer would
+    // dangle. The next graph (e.g. LLM_GRAPH_TYPE_MTP / gemma4-assistant) may
+    // not set it, and set_outputs() would call ggml_set_output() on the freed
+    // pointer.
+    t_h_pre_norm  = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();

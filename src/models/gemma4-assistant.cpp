@@ -291,6 +291,11 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
     ggml_tensor * backbone = build_lora_mm(mtp.mtp_post_projection, h_inner);
     cb(backbone, "mtp_post_proj_out", -1);
     res->t_embd = backbone;
+    // Add backbone to forward graph so alloc_graph binds it to a buffer.
+    // decode_mtp reads it after compute as next-step h_prev. Without this,
+    // t_embd->buffer is null and the post-compute tensor_get hits
+    // "tensor buffer not set" in ggml_backend.cpp:342.
+    ggml_build_forward_expand(gf, backbone);
 
     cur = build_lora_mm(mtp.tok_embd, h_inner);
 

@@ -366,6 +366,15 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     }
     cur = inpL;
 
+    // Expose pre-final-norm hidden state for the gemma4_assistant MTP drafter.
+    // Mirrors qwen3moe.cpp:208. Read at draft() time via
+    // llama_context_get_t_h_pre_norm() — independent of cparams.embeddings,
+    // so it survives the server's per-decode toggling of that flag.
+    // (llm_graph_result::set_outputs() calls ggml_set_output(t_h_pre_norm) so
+    // we don't need a redundant call here.)
+    cb(cur, "h_pre_norm", -1);
+    res->t_h_pre_norm = cur;
+
     cur = build_norm(cur,
             model.output_norm, nullptr,
             LLM_NORM_RMS, -1);
