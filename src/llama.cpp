@@ -478,8 +478,8 @@ int llama_model_load_mtp_from_file(struct llama_model * model, const char * path
     }
 
     llama_model * tgt = (llama_model *) model;
-    if (tgt->arch != LLM_ARCH_GEMMA4) {
-        LLAMA_LOG_ERROR("%s: MTP target must be arch gemma4 (got %s)\n",
+    if (tgt->arch != LLM_ARCH_GEMMA4 && tgt->arch != LLM_ARCH_QWEN3MOE) {
+        LLAMA_LOG_ERROR("%s: MTP target must be arch gemma4 or qwen3moe (got %s)\n",
                 __func__, llm_arch_name(tgt->arch));
         return -2;
     }
@@ -490,9 +490,13 @@ int llama_model_load_mtp_from_file(struct llama_model * model, const char * path
         return -3;
     }
 
-    if (aux->arch != LLM_ARCH_GEMMA4_ASSISTANT) {
-        LLAMA_LOG_ERROR("%s: MTP weights must be arch gemma4_assistant (got %s)\n",
-                __func__, llm_arch_name(aux->arch));
+    // Pair the assistant arch with the target arch.
+    const bool valid_pair =
+        (tgt->arch == LLM_ARCH_GEMMA4    && aux->arch == LLM_ARCH_GEMMA4_ASSISTANT) ||
+        (tgt->arch == LLM_ARCH_QWEN3MOE  && aux->arch == LLM_ARCH_QWEN3MOE_ASSISTANT);
+    if (!valid_pair) {
+        LLAMA_LOG_ERROR("%s: MTP target/assistant arch mismatch (target=%s, assistant=%s)\n",
+                __func__, llm_arch_name(tgt->arch), llm_arch_name(aux->arch));
         llama_model_free(aux);
         return -4;
     }
