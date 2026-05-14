@@ -2486,11 +2486,6 @@ int32_t llama_context::decode_mtp(
         LLAMA_LOG_ERROR("%s: context has no KV memory\n", __func__);
         return -2;
     }
-    auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
-    if (!kv_iswa) {
-        LLAMA_LOG_ERROR("%s: MTP requires llama_kv_cache_iswa memory (Gemma 4 target)\n", __func__);
-        return -3;
-    }
 
     const int32_t  n_vocab = (int32_t) model.vocab.n_tokens();
     const uint32_t n_bb    = model.mtp_assistant->hparams.n_embd_backbone;
@@ -2560,11 +2555,11 @@ int32_t llama_context::decode_mtp(
         data->pos[0]   = attn_pos + 1 + (llama_pos) step;
         std::memcpy(data->embd.data(), hbuf.data(), n_bb * sizeof(float));
 
-        // Create a read-only memory context for the ISWA KV.
+        // Create a read-only memory context for the KV.
         // init_full() provides mask/index buffers without advancing the write cursor.
-        auto mctx_up = kv_iswa->init_full();
+        auto mctx_up = memory->init_full();
         if (!mctx_up) {
-            LLAMA_LOG_ERROR("%s: kv_iswa->init_full failed at step %d\n", __func__, step);
+            LLAMA_LOG_ERROR("%s: memory->init_full failed at step %d\n", __func__, step);
             rc = -10;
             break;
         }
