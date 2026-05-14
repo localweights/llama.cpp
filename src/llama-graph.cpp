@@ -2470,6 +2470,57 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_attn_mtp_plain(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * q_cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+            float     kq_scale,
+            int       il_mtp,
+        int32_t     il_kv_tgt,
+        int64_t     kv_embd_head_v,
+        int64_t     kv_n_head_v,
+            bool     use_k_as_v) const {
+    GGML_UNUSED(kv_embd_head_v);
+    GGML_UNUSED(kv_n_head_v);
+
+    auto * k_rot = inp->self_k_rot;
+    auto * v_rot = inp->self_v_rot;
+
+    if (k_rot) {
+        q_cur = ggml_mul_mat_aux(ctx0, q_cur, k_rot);
+    }
+
+    ggml_build_forward_expand(gf, q_cur);
+
+    const auto * mctx_cur = inp->mctx;
+    const auto & kq_mask  = inp->get_kq_mask();
+
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il_kv_tgt);
+    ggml_tensor * v = use_k_as_v ? k : mctx_cur->get_v(ctx0, il_kv_tgt);
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il_mtp);
+    cb(cur, "kqv_out_mtp", il_mtp);
+
+    if (v_rot) {
+        cur = ggml_mul_mat_aux(ctx0, cur, v_rot);
+    }
+
+    if (wo) {
+        cur = build_lora_mm(wo, cur);
+        cb(cur, "mtp_wo_out", il_mtp);
+    }
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mtp(
         llm_graph_input_attn_kv_iswa * inp,
         ggml_tensor * wo,

@@ -1013,6 +1013,24 @@ struct llm_graph_context {
                 int64_t   kv_n_head_v,
                    bool   use_k_as_v) const;
 
+    // Plain (non-iSWA) variant for MTP drafters whose target is a regular
+    // causal kv_cache (e.g. qwen3moe). Same semantics as build_attn_mtp
+    // minus the SWA/base split.
+    ggml_tensor * build_attn_mtp_plain(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * q_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il_mtp,
+                int32_t   il_kv_tgt,
+                int64_t   kv_embd_head_v,
+                int64_t   kv_n_head_v,
+                   bool   use_k_as_v) const;
+
     llm_graph_input_attn_cross * build_attn_inp_cross() const;
 
     ggml_tensor * build_attn(

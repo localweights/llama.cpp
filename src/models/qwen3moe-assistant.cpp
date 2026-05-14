@@ -2,6 +2,12 @@
 
 #include <cmath>
 
+#include "llama-model.h"
+#include "llama-arch.h"
+
+// Include the model declarations needed for the llama_model_mapping function
+#include "llama-model.h"
+
 // Qwen3MoE MTP assistant graph builder.
 // The assistant model cannot be used as a primary model (-m) — build_arch_graph()
 // is only valid when called from llama_context::decode_mtp() via the nested
@@ -12,23 +18,17 @@
 // ---------------------------------------------------------------------------
 
 void llama_model_qwen3moe_assistant::load_arch_hparams(llama_model_loader & ml) {
-    hparams.swa_type = LLAMA_SWA_TYPE_NONE;
-    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+    hparams.swa_type           = LLAMA_SWA_TYPE_NONE;
+    hparams.f_attention_scale  = 1.0f;
 
-    uint32_t n_kv_shared_layers = 0;
-    ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
+    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
-    hparams.n_layer_kv_from_start = hparams.n_layer - (int32_t) n_kv_shared_layers;
-    hparams.f_attention_scale     = 1.0f;
+    // n_embd_head_k / n_embd_head_v are derived from per-layer attn shape;
+    // the base loader populates them. requires_target_arch is metadata that
+    // the dispatcher checks separately — not needed in hparams.
 
-    ml.get_key(LLM_KV_ROPE_FREQ_BASE,              hparams.rope_freq_base_train, false);
-    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,  hparams.f_norm_rms_eps);
-    ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH,        hparams.n_embd_head_k);
-    ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH,      hparams.n_embd_head_v);
-
-    // Qwen3MoE assistant-specific keys
-    ml.get_key(LLM_KV_GEMMA4_ASSISTANT_N_EMBD_BACKBONE,        hparams.n_embd_backbone,        false);
-    ml.get_key(LLM_KV_GEMMA4_ASSISTANT_REQUIRES_TARGET_ARCH,  hparams.requires_target_arch,   false);
+    // Qwen3MoE assistant-specific: n_embd_backbone (target's n_embd).
+    ml.get_key(LLM_KV_QWEN3MOE_ASSISTANT_N_EMBD_BACKBONE, hparams.n_embd_backbone, false);
 
     type = LLM_TYPE_UNKNOWN;
 }
@@ -165,7 +165,6 @@ llm_build_qwen3moe_mtp::llm_build_qwen3moe_mtp(
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_v(il));
 
         const int64_t n_head = hparams.n_head(il);
-        const int64_t n_head_kv = hparams.n_head_kv(il);
 
         const float freq_base_l  = mtp.get_rope_freq_base(cparams, il);
         const float freq_scale_l = mtp.get_rope_freq_scale(cparams, il);
@@ -191,15 +190,15 @@ llm_build_qwen3moe_mtp::llm_build_qwen3moe_mtp(
                              freq_base_l, freq_scale_l, ext_factor, attn_factor, beta_fast, beta_slow);
         cb(Qcur, "Qcur_pos", il);
 
-        const bool read_swa = false; // No SWA in Qwen3MoE
-
-        const int32_t il_kv = static_cast<int32_t>(target.hparams.n_layer - 1); // Use last layer only
+        const int32_t il_kv = static_cast<int32_t>(target.hparams.n_layer - 1); // Use last target layer only
 
         const int64_t kv_embd_head_v = target.hparams.n_embd_head_v(il_kv);
         const int64_t kv_n_head_v    = target.hparams.n_head_kv(il_kv);
 
-        cur = build_attn_mtp(inp_attn, mtp.layers[il].wo, nullptr, Qcur, nullptr, nullptr, nullptr,
-                hparams.f_attention_scale, il, il_kv, read_swa, kv_embd_head_v, kv_n_head_v, false);
+        const float kq_scale = 1.0f / sqrtf((float) n_embd_head);
+
+        cur = build_attn_mtp_plain(inp_attn, mtp.layers[il].wo, nullptr, Qcur, nullptr, nullptr, nullptr,
+                kq_scale, il, il_kv, kv_embd_head_v, kv_n_head_v, false);
 
         cur = build_norm(cur, mtp.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_post_norm", il);
