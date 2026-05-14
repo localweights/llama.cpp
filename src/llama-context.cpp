@@ -2547,6 +2547,13 @@ int32_t llama_context::decode_mtp(
     // The simplest approach: pass nullptr mctx and call process_ubatch with apply_mctx=false.
     // The drafter graph uses build_attn_mtp which fetches K/V directly by layer index.
 
+    // Force-disable flash attention for the drafter graph. Some assistants
+    // (gemma-4-e4b) have attention head shapes (e.g. head_dim=512) that
+    // ggml_cuda_flash_attn_ext does not support and aborts in fattn.cu:109.
+    // The target's flash_attn setting is restored after the loop.
+    const bool saved_flash_attn = cparams.flash_attn;
+    cparams.flash_attn = false;
+
     int32_t rc = 0;
     for (int step = 0; step < n_steps; ++step) {
         data->token[0] = cur_tok;
@@ -2614,6 +2621,7 @@ int32_t llama_context::decode_mtp(
     }
 
     n_outputs = save_n_outputs;
+    cparams.flash_attn = saved_flash_attn;
 
     if (rc == 0 && out_h_prev_last) {
         std::memcpy(out_h_prev_last, hbuf.data(), n_bb * sizeof(float));

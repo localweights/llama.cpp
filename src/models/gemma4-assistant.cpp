@@ -69,7 +69,7 @@ void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
         if (n_c == 0) {
             throw std::runtime_error("gemma4_assistant: use_ordered_embeddings requires n_centroids > 0");
         }
-        mtp_centroids      = create_tensor(tn(LLM_TENSOR_MTP_CENTROIDS,      "weight"), {(int64_t) n_c, n_embd}, 0);
+        mtp_centroids      = create_tensor(tn(LLM_TENSOR_MTP_CENTROIDS,      "weight"), {n_embd, (int64_t) n_c}, 0);
         mtp_token_ordering = create_tensor(tn(LLM_TENSOR_MTP_TOKEN_ORDERING, "weight"), {n_vocab}, TENSOR_NOT_REQUIRED);
     }
 
@@ -158,7 +158,13 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
     const int64_t n_bb = mtp.hparams.n_embd_backbone;
     GGML_ASSERT(n_bb > 0);
     GGML_ASSERT(mtp.mtp_pre_projection != nullptr && mtp.mtp_post_projection != nullptr);
-    GGML_ASSERT(!mtp.hparams.use_ordered_embeddings && "ordered embeddings (centroid head) not implemented in MTP graph yet");
+    // The e4b assistant ships with use_ordered_embeddings=true (centroid head
+    // + token_ordering for sparse top-k logit projection). We ignore both at
+    // inference and fall through to the standard tied-tok_embd logit path
+    // below. This gives slightly worse accept rate than the trained centroid
+    // path would, but still benefits from the trained drafter trunk. See
+    // [[plan-eagle-style-mtp-head-for-qwen3-coder-30b]] for proper centroid
+    // graph TODO.
 
     ggml_tensor * inp_tok = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
     ggml_set_input(inp_tok);
