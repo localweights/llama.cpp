@@ -1188,10 +1188,21 @@ struct common_speculative_state_gemma4_assistant : public common_speculative_sta
         llama_set_embeddings(ctx_tgt, true);
 
         std::vector<float> h_prev((size_t) n_bb, 0.0f);
+        bool h_valid = false;
         if (float * h_tgt = llama_get_embeddings_ith(ctx_tgt, h_idx)) {
             const int32_t n_out = llama_model_n_embd_out(model_tgt);
             const int32_t n_copy = std::min(n_bb, n_out);
             std::memcpy(h_prev.data(), h_tgt, (size_t) n_copy * sizeof(float));
+            h_valid = true;
+        }
+        // Skip drafter when target's last hidden state is unavailable (e.g.
+        // first turn before h_idx is wired, or batch produced no embeddings).
+        // Running the drafter graph on zero input causes a CUDA hang on
+        // Ampere (NaN propagation in attention softmax); CPU silently emits
+        // garbage drafts which all get rejected. Returning early is correct
+        // either way — no useful drafts without a valid target hidden state.
+        if (!h_valid) {
+            return;
         }
 
         llama_memory_t mem = llama_get_memory(ctx_tgt);
