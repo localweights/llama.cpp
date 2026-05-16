@@ -1306,10 +1306,13 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
                 const llama_seq_id sid_in = (batch_in.seq_id && batch_in.n_seq_id && batch_in.n_seq_id[last_output_k] > 0)
                         ? batch_in.seq_id[last_output_k][0] : 0;
                 if (sid_in == 0) {
-                    const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, last_output_k);
-                    if (h) {
+                    // Read directly from t_h_pre_norm graph tap (independent of cparams.embeddings).
+                    ggml_tensor * src = llama_context_get_t_h_pre_norm(ctx_tgt);
+                    if (src && src->ne[1] > 0) {
                         const size_t rb = (size_t) n_embd * sizeof(float);
-                        std::memcpy(pending_h[0].data(), h, rb);
+                        const int32_t row = std::min<int32_t>((int32_t) src->ne[1] - 1, last_output_k);
+                        llama_synchronize(ctx_tgt);
+                        ggml_backend_tensor_get(src, pending_h[0].data(), (size_t) row * rb, rb);
                     }
                 }
             }
@@ -1357,9 +1360,13 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
         }
 
         // Shift the tgt embeddings to the right by one position.
+        // Read from t_h_pre_norm graph tap (independent of cparams.embeddings).
         {
-            const float * h_tgt = llama_get_embeddings_pre_norm(ctx_tgt);
-            std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens - 1));
+            ggml_tensor * src = llama_context_get_t_h_pre_norm(ctx_tgt);
+            if (src && src->ne[1] >= (int64_t)(n_tokens - 1)) {
+                llama_synchronize(ctx_tgt);
+                ggml_backend_tensor_get(src, batch.embd + (size_t) 1 * n_embd, 0, row_bytes * (size_t)(n_tokens - 1));
+            }
         }
 
         // Fill the pending embedding from a previous run.
@@ -1390,9 +1397,21 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
             verify_pos_first[sid] = batch_in.pos[i_batch_beg[sid]];
             verify_h[sid].resize((size_t) n_rows * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[sid] + i);
-                std::memcpy(verify_h[sid].data() + (size_t) i * n_embd, h, row_bytes);
+            {
+                // Read full n_rows of h_pre_norm directly from graph tap.
+                ggml_tensor * src = llama_context_get_t_h_pre_norm(ctx_tgt);
+                if (src && src->ne[1] >= i_batch_beg[sid] + n_rows) {
+                    llama_synchronize(ctx_tgt);
+                    ggml_backend_tensor_get(src, verify_h[sid].data(),
+                            (size_t) i_batch_beg[sid] * row_bytes,
+                            (size_t) n_rows * row_bytes);
+                } else {
+                    // Fallback to host buffer path if tap unavailable
+                    for (int32_t i = 0; i < n_rows; ++i) {
+                        const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[sid] + i);
+                        if (h) std::memcpy(verify_h[sid].data() + (size_t) i * n_embd, h, row_bytes);
+                    }
+                }
             }
 
             std::memcpy(pending_h[sid].data(),
@@ -1424,6 +1443,9 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
 
         common_batch_add(batch, id_last, n_past, { sid }, true);
 
+        // Scratch buffer for in-loop h_row reads (avoids relying on persistent
+        // host pointer from llama_get_embeddings_pre_norm_ith).
+        std::vector<float> h_row_buf((size_t) n_embd, 0.0f);
         const float * h_row = pending_h[sid].data();
         std::memcpy(batch.embd + n_embd * (batch.n_tokens - 1), h_row, row_bytes);
 
@@ -1456,7 +1478,18 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
                     }
                     id = (llama_token) best;
                 }
-                h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch);
+                // Read MTP's post-FFN h directly from ctx_dft's t_h_pre_norm tap.
+                {
+                    ggml_tensor * src = llama_context_get_t_h_pre_norm(ctx_dft);
+                    if (src && src->ne[1] > i_batch) {
+                        llama_synchronize(ctx_dft);
+                        ggml_backend_tensor_get(src, h_row_buf.data(),
+                                (size_t) i_batch * row_bytes, row_bytes);
+                        h_row = h_row_buf.data();
+                    } else {
+                        h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch);
+                    }
+                }
                 ++i_batch;
                 GGML_UNUSED(i_batch);
 
