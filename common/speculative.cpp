@@ -1212,8 +1212,15 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
             sparams.no_perf  = false;
             sparams.top_k    = 1;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            // Keep sampler on the GPU so per-step logit retrieval doesn't force a CPU sync.
+            sparams.backend_sampling = true;
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
+
+        // Attach the draft sampler chain to ctx_dft so the GPU auto-samples
+        // during each decode and the result is read via llama_get_sampled_token_ith
+        // without forcing a host sync on logits.
+        llama_set_sampler(ctx_dft, 0, common_sampler_get(smpls[0].get()));
 
         llama_set_embeddings_pre_norm(ctx_tgt, true);
         llama_set_embeddings_pre_norm(ctx_dft, true);
