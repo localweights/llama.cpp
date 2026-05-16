@@ -33,7 +33,8 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
-    LLM_GRAPH_TYPE_MTP,  // Gemma 4 assistant drafter — reads target KV, no KV write
+    LLM_GRAPH_TYPE_MTP,         // Eagle3/gemma4 assistant drafter — reads target KV, no KV write (retrofit)
+    LLM_GRAPH_TYPE_DECODER_MTP, // Native MTP module embedded in target model (Qwen3-Next etc)
 };
 
 enum llm_ffn_op_type {
@@ -663,6 +664,7 @@ public:
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+    ggml_tensor * get_h_pre_norm()  const { return t_h_pre_norm; }
 
     ggml_tensor * get_h_pre_norm() const { return t_h_pre_norm; }
 
@@ -693,6 +695,7 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+    ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     // MTP related inputs/outputs
     ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state required for MTP
