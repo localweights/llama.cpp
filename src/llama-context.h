@@ -86,8 +86,9 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
-    ggml_tensor * get_t_h_pre_norm() const;
-    ggml_tensor * get_t_mtp_out()    const;
+    ggml_tensor * get_t_h_pre_norm()    const;
+    ggml_tensor * get_t_mtp_out()       const;
+    ggml_tensor * get_t_sampled_token() const;
 
     // Translate batch token index to output row index in t_h_pre_norm/logits.
     // Returns -1 if the token was not configured to output.

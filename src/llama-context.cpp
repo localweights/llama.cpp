@@ -4043,6 +4043,14 @@ ggml_tensor * llama_context_get_t_mtp_out(struct llama_context * ctx) {
     return ctx ? ctx->get_t_mtp_out() : nullptr;
 }
 
+ggml_tensor * llama_context::get_t_sampled_token() const {
+    return gf_res_prev ? gf_res_prev->t_sampled_token : nullptr;
+}
+
+ggml_tensor * llama_context_get_t_sampled_token(struct llama_context * ctx) {
+    return ctx ? ctx->get_t_sampled_token() : nullptr;
+}
+
 int32_t llama_context_get_output_row(struct llama_context * ctx, int32_t batch_token_idx) {
     return ctx ? ctx->get_output_row(batch_token_idx) : -1;
 }

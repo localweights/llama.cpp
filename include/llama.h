@@ -1026,8 +1026,9 @@ extern "C" {
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
 
     // [EXPERIMENTAL] MTP APIs, accessors for hidden states
-    LLAMA_API struct ggml_tensor * llama_context_get_t_h_pre_norm(struct llama_context * ctx);
-    LLAMA_API struct ggml_tensor * llama_context_get_t_mtp_out   (struct llama_context * ctx);
+    LLAMA_API struct ggml_tensor * llama_context_get_t_h_pre_norm   (struct llama_context * ctx);
+    LLAMA_API struct ggml_tensor * llama_context_get_t_mtp_out      (struct llama_context * ctx);
+    LLAMA_API struct ggml_tensor * llama_context_get_t_sampled_token(struct llama_context * ctx);
 
     // Translate a batch token index (as returned by slot.i_batch) to an output row
     // in t_h_pre_norm / logits.  Returns -1 if the token was not an output token.
