@@ -3643,14 +3643,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-type"}, "[none|mtp|gemma4_assistant|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
-        string_format("type of speculative decoding (default: %s). For Gemma 4 MTP use --spec-type gemma4_assistant and --mtp-head pointing at gemma4_assistant GGUF.\n",
+        {"--spec-type"}, "[none|mtp|draft-mtp|gemma4_assistant|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
+        string_format("type of speculative decoding (default: %s). For Gemma 4 MTP use --spec-type gemma4_assistant and --mtp-head pointing at gemma4_assistant GGUF. For NextN-MTP trunks (qwen3moe_mtp/qwen35moe_mtp) use --spec-type draft-mtp.\n",
             common_speculative_type_name_str(params.speculative.types).c_str()),
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
             } else if (value == "mtp") {
                 params.speculative.types = { COMMON_SPECULATIVE_TYPE_MTP };
+            } else if (value == "draft-mtp") {
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
             } else if (value == "gemma4_assistant") {
                 params.speculative.types = { COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT };
             } else if (value == "ngram-cache") {

@@ -180,7 +180,7 @@ struct server_slot {
 
     bool is_mtp() const { return is_mtp_enabled; }
 
-    bool need_embd() const { return task->need_embd() || is_mtp(); }
+    bool need_embd() const { return task->need_embd() || is_mtp() || (spec && common_speculative_need_embd(spec.get())); }
 
     void prompt_clear(bool allow_processing) {
         if (!allow_processing) {
@@ -925,6 +925,8 @@ private:
 
     llama_model_ptr model_dft;
 
+    llama_context_ptr ctx_dft; // separate draft context (used by DRAFT_MTP inline path)
+
     llama_model_ptr model_mtp;
 
     bool add_bos_token = true;
@@ -1189,6 +1191,30 @@ private:
             params_base.speculative.draft.model = model_dft.get();
             params_base.speculative.draft.cparams = common_context_params_to_llama(params_dft);
             params_base.speculative.draft.cparams.n_rs_seq = 0;
+        }
+
+        // Inline DRAFT_MTP: model has embedded NextN-MTP layers (kv_only_nextn=true).
+        // No separate draft GGUF — create a 2nd context against the trunk model with
+        // ctx_type=LLAMA_CONTEXT_TYPE_MTP to bind the MTP layers as the drafter.
+        if (!params_base.speculative.has_dft() &&
+            std::find(params_base.speculative.types.begin(),
+                      params_base.speculative.types.end(),
+                      COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()) {
+            SRV_INF("creating MTP draft context against the target model '%s'\n",
+                    params_base.model.path.c_str());
+
+            auto cparams_mtp = common_context_params_to_llama(params_base);
+            cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_mtp.n_rs_seq = 0;
+
+            ctx_dft.reset(llama_init_from_model(model, cparams_mtp));
+            if (ctx_dft == nullptr) {
+                SRV_ERR("%s", "failed to create MTP draft context\n");
+                return false;
+            }
+
+            params_base.speculative.draft.ctx_tgt = ctx;
+            params_base.speculative.draft.ctx_dft = ctx_dft.get();
         }
 
         //TODO: generalize if this is ok, we should load <arch_name>_mtp arch?
@@ -3402,6 +3428,13 @@ private:
             };
 
             const int ret = llama_decode(ctx, batch_view);
+
+            // DRAFT_MTP: forward trunk embeddings to any impl that needs them.
+            for (auto & s : slots) {
+                if (s.spec && common_speculative_need_embd(s.spec.get())) {
+                    common_speculative_process(s.spec.get(), batch_view);
+                }
+            }
 
             metrics.on_decoded(slots);
 

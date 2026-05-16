@@ -58,6 +58,13 @@ void common_speculative_print_stats(const common_speculative * spec);
 // on the next request assigned to the same slot.
 void common_speculative_reset_kv(common_speculative * spec);
 
+// Forward batch info to each speculative impl (DRAFT_MTP captures trunk embeddings here).
+// Returns true on success; false if any impl signaled a fatal mismatch.
+bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+
+// True if any active impl requires target embeddings to be extracted on prefill.
+bool common_speculative_need_embd(common_speculative * spec);
+
 // Phase D.1: Direct-commit query.
 //
 // After a tree-mode draft() call, returns the number of accepted tokens that
