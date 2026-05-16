@@ -1,6 +1,9 @@
 #include "speculative.h"
 #include "tree-spec.h"
 
+#include <chrono>
+#include <cstdlib>
+
 #include "common.h"
 #include "ggml.h"
 #include "llama.h"
@@ -1447,11 +1450,24 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
         const float * h_row = pending_h[sid].data();
         std::memcpy(batch.embd + n_embd * (batch.n_tokens - 1), h_row, row_bytes);
 
+        // Chain-step CPU-side timing (gated by env DRAFT_MTP_TIMING=1).
+        static const bool dbg_timing = (getenv("DRAFT_MTP_TIMING") != nullptr);
+        static thread_local int64_t t_prefill_ns = 0;
+        static thread_local int64_t t_decode_ns = 0;
+        static thread_local int64_t t_sample_ns = 0;
+        static thread_local int64_t t_hread_ns = 0;
+        static thread_local int64_t n_chains = 0;
+        static thread_local int64_t n_steps_total = 0;
+        auto t0 = std::chrono::steady_clock::now();
+
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
         }
+
+        auto t1 = std::chrono::steady_clock::now();
+        t_prefill_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
 
         int i = 0;
 
@@ -1461,25 +1477,57 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
             common_batch_clear(batch);
 
             bool p_min_break = false;
+            auto ts0 = std::chrono::steady_clock::now();
             {
-                // CPU sampler chain. top_k=10 + softmax exposes normalized p.
-                auto * smpl = smpls[sid].get();
-                common_sampler_sample(smpl, ctx_dft, i_batch, true);
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
-                const llama_token id = cur_p->data[0].id;
-                const float       p  = cur_p->data[0].p;
-                common_sampler_accept(smpl, id, true);
+                // Two sampler paths:
+                //  - need_prob path: use common_sampler with top_k=10 + softmax
+                //    to expose top-1 probability for the p_min chain-break check.
+                //    Costs ~0.8ms per call on a 152K-vocab model (softmax + sort).
+                //  - fast path (p_min=0 or n_min not yet satisfied): read the
+                //    device-side argmax from res->t_sampled_token. ~0.01ms.
+                //    Wired in qwen{3moe,35,35moe}_mtp graph builders.
+                llama_token id;
+                float       p = 1.0f;
+                const bool need_prob = (params.p_min > 0.0f &&
+                                        params.n_min <= (int) result.size() + 1);
+
+                if (need_prob) {
+                    auto * smpl = smpls[sid].get();
+                    common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                    id = cur_p->data[0].id;
+                    p  = cur_p->data[0].p;
+                    common_sampler_accept(smpl, id, true);
+                } else {
+                    ggml_tensor * st = llama_context_get_t_sampled_token(ctx_dft);
+                    if (st && st->ne[0] > i_batch) {
+                        llama_synchronize(ctx_dft);
+                        int32_t tok = 0;
+                        ggml_backend_tensor_get(st, &tok,
+                                (size_t) i_batch * sizeof(int32_t), sizeof(int32_t));
+                        id = (llama_token) tok;
+                    } else {
+                        const float * logits = llama_get_logits_ith(ctx_dft, i_batch);
+                        const int32_t n_vocab = llama_vocab_n_tokens(
+                                llama_model_get_vocab(llama_get_model(ctx_dft)));
+                        id = 0;
+                        float best = logits[0];
+                        for (int32_t v = 1; v < n_vocab; ++v) {
+                            if (logits[v] > best) { best = logits[v]; id = v; }
+                        }
+                    }
+                    // Keep sampler chain in sync (some sampler state is cross-call).
+                    common_sampler_accept(smpls[sid].get(), id, true);
+                }
 
                 // Honor params.draft.p_min: stop chaining further drafts
                 // once the drafter's confidence falls below threshold.
-                // The current token still gets pushed (best guess so far);
-                // we just don't draft beyond it. Upstream's DRAFT_MTP has
-                // this as TODO; unsloth's blog claims 1.8x speedup with
-                // p_min=0.75. Requires n_min satisfied to allow break.
                 if (params.p_min > 0.0f && p < params.p_min &&
                     params.n_min <= (int) result.size() + 1) {
                     p_min_break = true;
                 }
+                auto ts1 = std::chrono::steady_clock::now();
+                t_sample_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(ts1 - ts0).count();
                 // Read MTP's post-FFN h directly from ctx_dft's t_h_pre_norm tap.
                 {
                     ggml_tensor * src = llama_context_get_t_h_pre_norm(ctx_dft);
@@ -1492,6 +1540,8 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
                         h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch);
                     }
                 }
+                auto ts2 = std::chrono::steady_clock::now();
+                t_hread_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(ts2 - ts1).count();
                 ++i_batch;
                 GGML_UNUSED(i_batch);
 
@@ -1509,7 +1559,11 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
                 break;
             }
 
+            auto td0 = std::chrono::steady_clock::now();
             ret = llama_decode(ctx_dft, batch);
+            auto td1 = std::chrono::steady_clock::now();
+            t_decode_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(td1 - td0).count();
+            ++n_steps_total;
             if (ret != 0) {
                 LOG_WRN("%s: llama_decode[%d] returned %d\n", __func__, i, ret);
                 break;
@@ -1523,6 +1577,22 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
         }
 
         last_n_drafted[sid] = (uint16_t) result.size();
+
+        if (dbg_timing) {
+            ++n_chains;
+            if (n_chains == 256) {
+                const double inv = 1.0 / 1.0e6; // ns -> ms
+                LOG_INF("DRAFT_MTP_TIMING: chains=%lld steps=%lld prefill=%.2fms decode=%.2fms sample=%.2fms hread=%.2fms (per-step: dec=%.3fms smp=%.3fms hr=%.3fms)\n",
+                        (long long) n_chains, (long long) n_steps_total,
+                        t_prefill_ns * inv, t_decode_ns * inv, t_sample_ns * inv, t_hread_ns * inv,
+                        n_steps_total ? (t_decode_ns * inv / n_steps_total) : 0.0,
+                        n_steps_total ? (t_sample_ns * inv / (n_steps_total + n_chains)) : 0.0,
+                        n_steps_total ? (t_hread_ns  * inv / (n_steps_total + n_chains)) : 0.0);
+                t_prefill_ns = t_decode_ns = t_sample_ns = t_hread_ns = 0;
+                n_chains = 0;
+                n_steps_total = 0;
+            }
+        }
     }
 
     void accept(uint16_t n_accepted, int32_t /*last_accepted_row*/ = -1) override {
