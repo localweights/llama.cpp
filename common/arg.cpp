@@ -3630,8 +3630,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.speculative.draft.mparams.path = value;
             // Auto-select gemma4_assistant if no spec-type was explicitly set yet
-            if (params.speculative.type == COMMON_SPECULATIVE_TYPE_NONE) {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT;
+            if (params.speculative.types.empty() || params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE) {
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT };
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_MTP_HEAD"));
@@ -3643,30 +3643,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-type"}, "[none|mtp|gemma4_assistant|qwen3_assistant|qwen3moe_assistant|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
-        string_format("type of speculative decoding (default: %s). For Gemma 4 MTP use --spec-type gemma4_assistant and --mtp-head pointing at gemma4_assistant GGUF.\n"
-            "For Qwen3 MTP use --spec-type qwen3_assistant and --mtp-head pointing at qwen3_assistant GGUF.\n"
-            "For Qwen3 MoE MTP use --spec-type qwen3moe_assistant and --mtp-head pointing at qwen3moe_assistant GGUF.\n",
-            common_speculative_type_to_str(params.speculative.type).c_str()),
+        {"--spec-type"}, "[none|mtp|gemma4_assistant|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
+        string_format("type of speculative decoding (default: %s). For Gemma 4 MTP use --spec-type gemma4_assistant and --mtp-head pointing at gemma4_assistant GGUF.\n",
+            common_speculative_type_name_str(params.speculative.types).c_str()),
         [](common_params & params, const std::string & value) {
             if (value == "none") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
             } else if (value == "mtp") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_MTP };
             } else if (value == "gemma4_assistant") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT;
-            } else if (value == "qwen3_assistant" || value == "qwen3moe_assistant") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT;
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT };
             } else if (value == "ngram-cache") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_NGRAM_CACHE };
             } else if (value == "ngram-simple") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE;
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE };
             } else if (value == "ngram-map-k") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K;
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K };
             } else if (value == "ngram-map-k4v") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V };
             } else if (value == "ngram-mod") {
-                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_NGRAM_MOD };
             } else {
                 throw std::invalid_argument("unknown speculative decoding type");
             }

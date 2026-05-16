@@ -40,7 +40,7 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, bool on_device, llama_pos pos_min = -1, llama_pos pos_max = -1) {
+static void common_prompt_checkpoint_update(common_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, bool on_device, llama_pos pos_min = -1, llama_pos pos_max = -1) {
     if (pos_min == -1) {
         pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), id);
     }
@@ -58,9 +58,9 @@ static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, lla
     ckpt.pos_min  = pos_min;
     ckpt.pos_max  = pos_max;
     ckpt.n_tokens = n_tokens;
-    ckpt.data.resize(checkpoint_size);
+    ckpt.data_tgt.resize(checkpoint_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, ckpt.data.data(), checkpoint_size, id, flags);
+    const size_t n = llama_state_seq_get_data_ext(ctx, ckpt.data_tgt.data(), checkpoint_size, id, flags);
     if (n != checkpoint_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", checkpoint_size, n);
     }
@@ -96,7 +96,7 @@ struct server_slot {
     // speculative decoding
     llama_tokens spec_draft;
     std::vector<int32_t> spec_i_batch;
-    server_prompt_checkpoint spec_ckpt;
+    common_prompt_checkpoint spec_ckpt;
     common_speculative_ptr spec;
 
     // Phase E.1: tree skip-redecode state.
@@ -161,16 +161,16 @@ struct server_slot {
         SRV_WRN(" - saving prompt with length %d, total state size = %.3f MiB\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size);
+        auto * cur = prompt_cache.alloc(prompt, cur_size, /* state_size_drft */ 0);
         if (cur == nullptr) {
             return;
         }
 
-        llama_state_seq_get_data_ext(ctx, cur->data.data(), cur_size, id, 0);
+        llama_state_seq_get_data_ext(ctx, cur->data.main.data(), cur_size, id, 0);
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx, id);
+        bool res = prompt_cache.load(prompt, tokens, ctx, /* ctx_drft */ nullptr, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -432,10 +432,10 @@ struct server_slot {
                     // Tree-committed drafts already have KV in place; checkpoint not needed.
                     const auto n_tokens = prompt.tokens.size();
 
-                    server_prompt_checkpoint_update(spec_ckpt, ctx, this->id, n_tokens, true);
+                    common_prompt_checkpoint_update(spec_ckpt, ctx, this->id, n_tokens, true);
 
                     SLT_DBG(*this, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %zu, size = %.3f MiB)\n",
-                            spec_ckpt.pos_min, spec_ckpt.pos_max, n_tokens, (float) spec_ckpt.data.size() / 1024 / 1024);
+                            spec_ckpt.pos_min, spec_ckpt.pos_max, n_tokens, (float) spec_ckpt.size() / 1024 / 1024);
                 }
             }
 
@@ -724,7 +724,7 @@ struct server_slot {
 //
 
 static bool slot_checkpoints_save(const std::string & filepath,
-                                  const std::list<server_prompt_checkpoint> & checkpoints) {
+                                  const std::list<common_prompt_checkpoint> & checkpoints) {
     if (checkpoints.empty()) {
         return true;
     }
@@ -746,13 +746,13 @@ static bool slot_checkpoints_save(const std::string & filepath,
     ok = ok && fwrite(&n_cp,    sizeof(n_cp),    1, fp) == 1;
 
     for (const auto & cp : checkpoints) {
-        const uint64_t data_size = cp.data.size();
+        const uint64_t data_size = cp.data_tgt.size();
         ok = ok && fwrite(&cp.pos_min,  sizeof(cp.pos_min),  1, fp) == 1;
         ok = ok && fwrite(&cp.pos_max,  sizeof(cp.pos_max),  1, fp) == 1;
         ok = ok && fwrite(&cp.n_tokens, sizeof(cp.n_tokens), 1, fp) == 1;
         ok = ok && fwrite(&data_size,   sizeof(data_size),   1, fp) == 1;
         if (data_size > 0) {
-            ok = ok && fwrite(cp.data.data(), 1, data_size, fp) == data_size;
+            ok = ok && fwrite(cp.data_tgt.data(), 1, data_size, fp) == data_size;
         }
     }
 
@@ -769,7 +769,7 @@ static bool slot_checkpoints_save(const std::string & filepath,
 }
 
 static bool slot_checkpoints_load(const std::string & filepath,
-                                  std::list<server_prompt_checkpoint> & checkpoints) {
+                                  std::list<common_prompt_checkpoint> & checkpoints) {
     const std::string cp_path = filepath + ".checkpoints";
     FILE * fp = fopen(cp_path.c_str(), "rb");
     if (!fp) {
@@ -791,15 +791,15 @@ static bool slot_checkpoints_load(const std::string & filepath,
     checkpoints.clear();
 
     for (uint32_t i = 0; i < n_cp && ok; i++) {
-        server_prompt_checkpoint cp;
+        common_prompt_checkpoint cp;
         uint64_t data_size = 0;
         ok = ok && fread(&cp.pos_min,  sizeof(cp.pos_min),  1, fp) == 1;
         ok = ok && fread(&cp.pos_max,  sizeof(cp.pos_max),  1, fp) == 1;
         ok = ok && fread(&cp.n_tokens, sizeof(cp.n_tokens), 1, fp) == 1;
         ok = ok && fread(&data_size,   sizeof(data_size),   1, fp) == 1;
         if (ok && data_size > 0) {
-            cp.data.resize(data_size);
-            ok = ok && fread(cp.data.data(), 1, data_size, fp) == data_size;
+            cp.data_tgt.resize(data_size);
+            ok = ok && fread(cp.data_tgt.data(), 1, data_size, fp) == data_size;
         }
         if (ok) {
             checkpoints.push_back(std::move(cp));
@@ -1121,7 +1121,8 @@ private:
         // Tree verify (mtp_tree_verify) needs seq_cp(slot_seq→path_seq, partial range),
         // which only works with kv_unified=true (n_stream=1 → partial seq_cp allowed).
         {
-            const bool has_tree = (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) &&
+            const bool has_tree = (!params_base.speculative.types.empty() &&
+                                   params_base.speculative.types[0] == COMMON_SPECULATIVE_TYPE_MTP) &&
                                   (params_base.speculative.mtp.tree_branching > 1);
             if (has_tree && !params_base.kv_unified) {
                 SRV_INF("%s: MTP tree mode: enabling kv_unified=true on main ctx "
@@ -1184,7 +1185,7 @@ private:
         }
 
         //TODO: generalize if this is ok, we should load <arch_name>_mtp arch?
-        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
+        if (!params_base.speculative.types.empty() && params_base.speculative.types[0] == COMMON_SPECULATIVE_TYPE_MTP) {
             char trunk_arch[64] = {0};
             llama_model_meta_val_str(model, "general.architecture", trunk_arch, sizeof(trunk_arch));
 
@@ -1357,7 +1358,8 @@ private:
 
             // try speculative decoding
             if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
-                slot.is_mtp_enabled = params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
+                slot.is_mtp_enabled = !params_base.speculative.types.empty() &&
+                                      params_base.speculative.types[0] == COMMON_SPECULATIVE_TYPE_MTP;
                 if (slot.is_mtp_enabled) {
                     // Each slot drives a unique trunk seq_id == slot.id.
                     params_base.speculative.mtp.seq_id = (llama_seq_id) slot.id;
@@ -2391,18 +2393,18 @@ private:
             const auto & cur = slot.prompt.checkpoints.front();
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
+                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
-        server_prompt_checkpoint_update(cur, ctx, slot.id, slot.prompt.n_tokens() - n_tokens_cur, false, pos_min, pos_max);
+        common_prompt_checkpoint_update(cur, ctx, slot.id, slot.prompt.n_tokens() - n_tokens_cur, false, pos_min, pos_max);
 
         SLT_WRN(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
     void process_single_task(server_task && task) {
@@ -3097,8 +3099,8 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        const size_t checkpoint_size = it->data.size();
-                                        const size_t n = llama_state_seq_set_data_ext(ctx, it->data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        const size_t checkpoint_size = it->data_tgt.size();
+                                        const size_t n = llama_state_seq_set_data_ext(ctx, it->data_tgt.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                                         if (n != checkpoint_size) {
                                             SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
@@ -3125,7 +3127,7 @@ private:
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
-                                        SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
+                                        SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -3200,7 +3202,7 @@ private:
                     // - the model supports partial sequence removal but only up to a fixed bound
                     do_checkpoint = do_checkpoint && (
                             slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL         ||
-                            slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED ||
+                            slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
                     bool has_mtmd = false;
@@ -3697,10 +3699,10 @@ private:
                             SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n",
                                     ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                            const size_t n = llama_state_seq_set_data_ext(slot.ctx, ckpt.data.data(), ckpt.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-                            if (n != ckpt.size()) {
+                            const size_t n = llama_state_seq_set_data_ext(slot.ctx, ckpt.data_dft.data(), ckpt.data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                            if (n != ckpt.data_dft.size()) {
                                 GGML_ABORT("%s: failed to restore context checkpoint (pos_min=%d, pos_max=%d, size=%zu, get_data_ext->%zu, set_data_ext->%zu",
-                                        __func__, ckpt.pos_min, ckpt.pos_max, ckpt.size(), ckpt.size(), n);
+                                        __func__, ckpt.pos_min, ckpt.pos_max, ckpt.data_dft.size(), ckpt.data_dft.size(), n);
                             }
 
                             // ctx_mtp has no analogous checkpointing — auto-mirror
@@ -3881,9 +3883,10 @@ server_context_meta server_context::get_meta() const {
         /* has_mtmd               */ impl->mctx != nullptr,
         /* has_inp_image          */ impl->chat_params.allow_image,
         /* has_inp_audio          */ impl->chat_params.allow_audio,
+        /* json_ui_settings       */ impl->json_webui_settings,
         /* json_webui_settings    */ impl->json_webui_settings,
         /* slot_n_ctx             */ impl->get_slot_n_ctx(),
-        /* pooling_type           */ llama_pooling_type(impl->ctx),
+        /* pooling_type           */ llama_get_pooling_type(impl->ctx),
 
         /* chat_params            */ impl->chat_params,
         /* chat_template_caps     */ common_chat_templates_get_caps(impl->chat_params.tmpls.get()),
@@ -4904,6 +4907,26 @@ void server_routes::init_routes() {
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
+    };
+}
+
+json server_routes::get_model_info() const {
+    return json {
+        {"id",       meta->model_name},
+        {"aliases",  meta->model_aliases},
+        {"tags",     meta->model_tags},
+        {"object",   "model"},
+        {"created",  std::time(0)},
+        {"owned_by", "llamacpp"},
+        {"meta",     {
+            {"vocab_type",  meta->model_vocab_type},
+            {"n_vocab",     meta->model_vocab_n_tokens},
+            {"n_ctx",       meta->slot_n_ctx},
+            {"n_ctx_train", meta->model_n_ctx_train},
+            {"n_embd",      meta->model_n_embd_inp},
+            {"n_params",    meta->model_n_params},
+            {"size",        meta->model_size},
+        }},
     };
 }
 

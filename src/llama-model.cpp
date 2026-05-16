@@ -136,8 +136,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_gemma4(params);
         case LLM_ARCH_GEMMA4_ASSISTANT:
             return new llama_model_gemma4_assistant(params);
-        case LLM_ARCH_QWEN3MOE_ASSISTANT:
-            return new llama_model_qwen3moe_assistant(params);
         case LLM_ARCH_GEMMA_EMBEDDING:
             return new llama_model_gemma_embedding(params);
         case LLM_ARCH_STARCODER2:
@@ -2119,9 +2117,6 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             case LLM_ARCH_GEMMA4_ASSISTANT:
                 llm = std::make_unique<llm_build_gemma4_mtp>(*this, *mtp_assistant, params);
                 break;
-            case LLM_ARCH_QWEN3MOE_ASSISTANT:
-                llm = std::make_unique<llm_build_qwen3moe_mtp>(*this, *mtp_assistant, params);
-                break;
             default:
                 throw std::runtime_error(
                     std::string("unsupported MTP assistant arch: ") +
@@ -2353,7 +2348,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_GEMMA4:
         case LLM_ARCH_GEMMA4_ASSISTANT:
-        case LLM_ARCH_QWEN3MOE_ASSISTANT:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_STARCODER2:
         case LLM_ARCH_OPENELM:

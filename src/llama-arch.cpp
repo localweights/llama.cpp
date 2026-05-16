@@ -61,7 +61,6 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GEMMA3N,          "gemma3n"          },
     { LLM_ARCH_GEMMA4,           "gemma4"           },
     { LLM_ARCH_GEMMA4_ASSISTANT, "gemma4_assistant" },
-    { LLM_ARCH_QWEN3MOE_ASSISTANT, "qwen3moe_assistant" },
     { LLM_ARCH_GEMMA_EMBEDDING,  "gemma-embedding"  },
     { LLM_ARCH_STARCODER2,       "starcoder2"       },
     { LLM_ARCH_MAMBA,            "mamba"            },
@@ -289,8 +288,6 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_GEMMA4_ASSISTANT_ATTENTION_K_EQ_V,         "%s.attention.k_eq_v"          },
     { LLM_KV_GEMMA4_ASSISTANT_USE_ORDERED_EMBEDDINGS,   "%s.use_ordered_embeddings"    },
     { LLM_KV_GEMMA4_ASSISTANT_REQUIRES_TARGET_ARCH,     "%s.requires_target_arch"      },
-    { LLM_KV_QWEN3MOE_ASSISTANT_N_EMBD_BACKBONE,        "%s.n_embd_backbone"         },
-    { LLM_KV_QWEN3MOE_ASSISTANT_REQUIRES_TARGET_ARCH,  "%s.requires_target_arch"    },
 
     { LLM_KV_POSNET_EMBEDDING_LENGTH, "%s.posnet.embedding_length" },
     { LLM_KV_POSNET_BLOCK_COUNT,      "%s.posnet.block_count"      },

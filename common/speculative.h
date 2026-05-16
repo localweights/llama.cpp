@@ -6,7 +6,7 @@
 struct common_speculative;
 
 // comma separated list of all types
-std::string common_speculative_type_name_str();
+std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
 
 // convert string to type
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);

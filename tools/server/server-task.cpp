@@ -308,7 +308,7 @@ task_params server_task::params_from_json_cmpl(
     params.speculative.draft.n_max = std::max(params.speculative.draft.n_max, 0);
 
     // for debugging and research purposes
-    params.speculative.type = common_speculative_type_from_name(json_value(data, "speculative.type", common_speculative_type_to_str(defaults.speculative.type)));
+    params.speculative.types = { common_speculative_type_from_name(json_value(data, "speculative.type", common_speculative_type_to_str(defaults.speculative.types.empty() ? COMMON_SPECULATIVE_TYPE_NONE : defaults.speculative.types[0]))) };
 
     params.speculative.ngram_size_n     = json_value(data, "speculative.ngram_size_n", defaults.speculative.ngram_size_n);
     params.speculative.ngram_size_m     = json_value(data, "speculative.ngram_size_m", defaults.speculative.ngram_size_m);

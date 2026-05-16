@@ -1556,7 +1556,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         // per-path tree seq_ids.  Tree paths are assigned seq_ids starting at n_parallel
         // and we need at most tree_max_nodes extra seq_ids (one per leaf in the worst case).
         // Cap at LLAMA_MAX_SEQ - 1 to avoid overflow.
-        const bool has_tree = (params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) &&
+        const bool has_tree = (!params.speculative.types.empty() &&
+                               params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_MTP) &&
                               (params.speculative.mtp.tree_branching > 1);
         const int32_t extra_seqs = has_tree ? params.speculative.mtp.tree_max_nodes : 0;
         const int32_t raw_seq_max = params.n_parallel + extra_seqs;
@@ -1564,7 +1565,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     }
     {
         // Partial rollback enabled for our MTP path; upstream MTP path uses need_n_rs_seq()
-        const bool has_mtp_spec = params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
+        const bool has_mtp_spec = !params.speculative.types.empty() &&
+                                  params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_MTP;
         cparams.n_rs_seq = has_mtp_spec
             ? (uint32_t) params.speculative.draft.n_max
             : params.speculative.need_n_rs_seq();

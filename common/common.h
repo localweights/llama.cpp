@@ -13,6 +13,7 @@
 #include <string_view>
 #include <vector>
 #include <map>
+#include <memory>
 #include <algorithm>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
@@ -162,7 +163,6 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_EAGLE3,              // eagle3 draft model (our path)
     COMMON_SPECULATIVE_TYPE_MTP,                 // multi-token prediction (qwen3moe per-slot, our path)
     COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT,    // Gemma 4 MTP assistant drafter (--mtp-head)
-    COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT,     // Qwen3MoE Eagle drafter (--mtp-head, shares gemma4_assistant impl)
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,        // standalone draft model speculative decoding (upstream)
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,        // Eagle3 speculative decoding (upstream native)
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,           // Multi-token prediction (upstream native, Qwen3-Next etc)
@@ -312,9 +312,17 @@ struct common_params_speculative_draft {
 
     common_params_model mparams;
 
+    // Legacy fields used by our dispatcher (model+cparams pre-loaded by caller)
+    llama_model        * model  = nullptr;
+    llama_context_params cparams;
+
+    // --spec-replace mappings (target string → draft string)
+    std::vector<std::pair<std::string, std::string>> replacements;
+
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    int32_t n_ctx        = 0;  // draft context size (0 = inherit target seq ctx)
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -328,11 +336,17 @@ struct common_params_speculative_draft {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 };
 
+// Forward decl — actual class in common/ngram-mod.h
+struct common_ngram_mod;
+
 struct common_params_speculative_ngram_mod {
     int32_t n_match = 24;
 
     int32_t n_max = 64;
     int32_t n_min = 48;
+
+    // Lazy-init shared ngram model (built on first --spec-type ngram-mod activation)
+    std::shared_ptr<common_ngram_mod> obj;
 };
 
 struct common_params_speculative_ngram_map {
@@ -378,11 +392,10 @@ struct common_params_speculative {
     int32_t draft_block_size = 4;
 
     bool has_dft() const {
-        // GEMMA4_ASSISTANT / QWEN3_ASSISTANT embed the drafter into the target model via
-        // llama_model_load_mtp_from_file; they do NOT need a separate draft context.
-        // Skip draft-model loading for these types.
-        if (type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT ||
-            type == COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT) {
+        // GEMMA4_ASSISTANT embeds the drafter into the target model via
+        // llama_model_load_mtp_from_file; it does NOT need a separate draft context.
+        // Skip draft-model loading for this type.
+        if (!types.empty() && types[0] == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT) {
             return false;
         }
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();

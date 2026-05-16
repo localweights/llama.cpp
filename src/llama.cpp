@@ -498,8 +498,7 @@ int llama_model_load_mtp_from_file(struct llama_model * model, const char * path
 
     // Pair the assistant arch with the target arch.
     const bool valid_pair =
-        (tgt->arch == LLM_ARCH_GEMMA4    && aux->arch == LLM_ARCH_GEMMA4_ASSISTANT) ||
-        (tgt->arch == LLM_ARCH_QWEN3MOE  && aux->arch == LLM_ARCH_QWEN3MOE_ASSISTANT);
+        (tgt->arch == LLM_ARCH_GEMMA4    && aux->arch == LLM_ARCH_GEMMA4_ASSISTANT);
     if (!valid_pair) {
         LLAMA_LOG_ERROR("%s: MTP target/assistant arch mismatch (target=%s, assistant=%s)\n",
                 __func__, llm_arch_name(tgt->arch), llm_arch_name(aux->arch));
