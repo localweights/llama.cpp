@@ -1213,17 +1213,15 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 1;
+            // top_k=10 + softmax so cur_p[0].p is the normalized probability
+            // of the picked token. Lets draft() honor params.draft.p_min by
+            // terminating the chain when the drafter's confidence drops.
+            // Greedy effective: always picks argmax (top-1) but exposes p.
+            sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
-            // Keep sampler on the GPU so per-step logit retrieval doesn't force a CPU sync.
-            sparams.backend_sampling = true;
+            sparams.backend_sampling = false;
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
-
-        // Attach the draft sampler chain to ctx_dft so the GPU auto-samples
-        // during each decode and the result is read via llama_get_sampled_token_ith
-        // without forcing a host sync on logits.
-        llama_set_sampler(ctx_dft, 0, common_sampler_get(smpls[0].get()));
 
         llama_set_embeddings_pre_norm(ctx_tgt, true);
         llama_set_embeddings_pre_norm(ctx_dft, true);
@@ -1462,21 +1460,25 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
 
             common_batch_clear(batch);
 
+            bool p_min_break = false;
             {
-                // Fast path for top_k=1 greedy: try backend-sampled token first
-                // (no sampler chain), fall back to manual argmax over logits.
-                // Both still require ctx synchronize, but skip common_sampler_sample
-                // overhead (full sampler chain + cur_p construction + ~1.5ms/iter).
-                llama_token id = llama_get_sampled_token_ith(ctx_dft, i_batch);
-                if (id == LLAMA_TOKEN_NULL) {
-                    const float * logits = llama_get_logits_ith(ctx_dft, i_batch);
-                    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-                    int32_t best = 0;
-                    float   best_v = logits[0];
-                    for (int32_t v = 1; v < n_vocab; ++v) {
-                        if (logits[v] > best_v) { best_v = logits[v]; best = v; }
-                    }
-                    id = (llama_token) best;
+                // CPU sampler chain. top_k=10 + softmax exposes normalized p.
+                auto * smpl = smpls[sid].get();
+                common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                const llama_token id = cur_p->data[0].id;
+                const float       p  = cur_p->data[0].p;
+                common_sampler_accept(smpl, id, true);
+
+                // Honor params.draft.p_min: stop chaining further drafts
+                // once the drafter's confidence falls below threshold.
+                // The current token still gets pushed (best guess so far);
+                // we just don't draft beyond it. Upstream's DRAFT_MTP has
+                // this as TODO; unsloth's blog claims 1.8x speedup with
+                // p_min=0.75. Requires n_min satisfied to allow break.
+                if (params.p_min > 0.0f && p < params.p_min &&
+                    params.n_min <= (int) result.size() + 1) {
+                    p_min_break = true;
                 }
                 // Read MTP's post-FFN h directly from ctx_dft's t_h_pre_norm tap.
                 {
@@ -1495,7 +1497,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (params.n_max <= (int) result.size() || p_min_break) {
                     break;
                 }
 
