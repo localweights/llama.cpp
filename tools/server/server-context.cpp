@@ -1206,6 +1206,17 @@ private:
             auto cparams_mtp = common_context_params_to_llama(params_base);
             cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             cparams_mtp.n_rs_seq = 0;
+            // MTP drafter only ever decodes 1-token batches in chain mode +
+            // up to the prefill ubatch size in process(). Smaller batch/ubatch
+            // reduces per-decode dispatch overhead (CUDA kernel arg setup,
+            // graph node allocs). Cap at trunk's ubatch_size to keep prefill OK.
+            cparams_mtp.n_batch  = std::min<uint32_t>(cparams_mtp.n_batch,  (uint32_t) params_base.n_ubatch);
+            cparams_mtp.n_ubatch = std::min<uint32_t>(cparams_mtp.n_ubatch, (uint32_t) params_base.n_ubatch);
+            // Single-seq slot — no need for extra seq slots in MTP ctx.
+            cparams_mtp.n_seq_max = 1;
+            // Disable performance stats on the drafter to avoid the ggml-time-us calls
+            // inside synchronize() (small but per-decode).
+            cparams_mtp.no_perf = true;
 
             ctx_dft.reset(llama_init_from_model(model, cparams_mtp));
             if (ctx_dft == nullptr) {

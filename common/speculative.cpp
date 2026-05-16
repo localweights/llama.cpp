@@ -1182,6 +1182,9 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
     // Hidden rows from the most recent target verification batch, grouped by seq.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
+    // First trunk position covered by the last process() batch — used by accept()
+    // to trim ctx_dft KV of rejected-draft positions.
+    std::vector<llama_pos> verify_pos_first;
 
     // Per-seq draft length from the last draft() call.
     std::vector<uint16_t> last_n_drafted;
@@ -1232,6 +1235,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        verify_pos_first.assign(n_seq, -1);
 
         last_n_drafted.assign(n_seq, 0);
     }
@@ -1347,6 +1351,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
 
             const int32_t n_rows = i_batch_end[sid] - i_batch_beg[sid] + 1;
             verify_h_rows[sid] = n_rows;
+            verify_pos_first[sid] = batch_in.pos[i_batch_beg[sid]];
             verify_h[sid].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
@@ -1400,24 +1405,24 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
             common_batch_clear(batch);
 
             {
-                auto * smpl = smpls[sid].get();
-
-                common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                // Fast path for top_k=1 greedy: try backend-sampled token first
+                // (no sampler chain), fall back to manual argmax over logits.
+                // Both still require ctx synchronize, but skip common_sampler_sample
+                // overhead (full sampler chain + cur_p construction + ~1.5ms/iter).
+                llama_token id = llama_get_sampled_token_ith(ctx_dft, i_batch);
+                if (id == LLAMA_TOKEN_NULL) {
+                    const float * logits = llama_get_logits_ith(ctx_dft, i_batch);
+                    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                    int32_t best = 0;
+                    float   best_v = logits[0];
+                    for (int32_t v = 1; v < n_vocab; ++v) {
+                        if (logits[v] > best_v) { best_v = logits[v]; best = v; }
+                    }
+                    id = (llama_token) best;
+                }
                 h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch);
                 ++i_batch;
                 GGML_UNUSED(i_batch);
-
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    LOG_DBG(" - draft_mtp candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                }
-
-                const llama_token id = cur_p->data[0].id;
-
-                common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
 
@@ -1459,6 +1464,15 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
         const int32_t i_h        = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t  row_bytes  = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[sid].data(), verify_h[sid].data() + (size_t) i_h * n_embd, row_bytes);
+
+        // Trim ctx_dft KV of rejected-draft positions. process() populated MTP
+        // KV for ALL positions in the trunk verify batch, but trunk only
+        // accepted the first n_accepted+1. The remaining positions are stale
+        // and would let next-chain draft() start at a wrong n_past.
+        if (verify_pos_first[sid] >= 0 && (int32_t) n_accepted + 1 < n_rows) {
+            const llama_pos pos_keep_until = verify_pos_first[sid] + (llama_pos) n_accepted;
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, pos_keep_until + 1, -1);
+        }
     }
 
     int32_t n_max(const common_params_speculative & /*params_spec*/) const override {
