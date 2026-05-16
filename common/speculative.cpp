@@ -1280,6 +1280,42 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
             return true;
         }
 
+        // Detect prefill batches (only some positions have logits=true).
+        // For prefill we must NOT decode ctx_dft on the multi-position batch
+        // because the intermediate pre-norm rows are garbage and would
+        // poison MTP KV. We still need to capture pending_h from the LAST
+        // output row so the first draft() call has a valid h seed.
+        bool is_prefill = false;
+        if (batch_in.logits != nullptr) {
+            for (int k = 0; k < batch_in.n_tokens; ++k) {
+                if (batch_in.logits[k] == 0) {
+                    is_prefill = true;
+                    break;
+                }
+            }
+        }
+        if (is_prefill) {
+            // Find the last output row and capture its pre-norm h.
+            int last_output_k = -1;
+            for (int k = batch_in.n_tokens - 1; k >= 0; --k) {
+                if (batch_in.logits != nullptr && batch_in.logits[k] == 0) continue;
+                last_output_k = k;
+                break;
+            }
+            if (last_output_k >= 0) {
+                const llama_seq_id sid_in = (batch_in.seq_id && batch_in.n_seq_id && batch_in.n_seq_id[last_output_k] > 0)
+                        ? batch_in.seq_id[last_output_k][0] : 0;
+                if (sid_in == 0) {
+                    const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, last_output_k);
+                    if (h) {
+                        const size_t rb = (size_t) n_embd * sizeof(float);
+                        std::memcpy(pending_h[0].data(), h, rb);
+                    }
+                }
+            }
+            return true;
+        }
+
         // Roll back ctx_dft KV to the first incoming position. Previous draft chains
         // may have left positions in ctx_dft KV that the target rejected; process()
         // is called on the target's actually-accepted batch, so clear anything at
