@@ -698,6 +698,12 @@ public:
     // MTP related inputs/outputs
     ggml_tensor * t_mtp_out     = nullptr; // [n_embd, n_tokens]
 
+    // Device-side argmax(logits) used by NextN-MTP chain decode to avoid CPU
+    // sync between chain steps. Populated by qwen3moe_mtp / qwen35moe_mtp /
+    // qwen35_mtp graph builders when t_logits is the final output. nullptr if
+    // not built (greedy-mode chain only path).
+    ggml_tensor * t_sampled_token = nullptr; // [1, n_outputs] i32
+
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
     std::map<llama_seq_id, ggml_tensor*> t_sampled;

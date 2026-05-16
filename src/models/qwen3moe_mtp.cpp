@@ -211,4 +211,13 @@ llama_model_qwen3moe_mtp::graph::graph(const llama_model & model, const llm_grap
 
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
+
+    // NextN-MTP chain decode: queue a device-side argmax of the logits so the
+    // sampled token id is produced on GPU and can be device-copied into the
+    // next chain step's input tokens tensor without a CPU sync. Greedy only
+    // (top_k=1); other sampler chains take the regular logits path.
+    ggml_tensor * sampled = ggml_argmax(ctx0, cur);
+    cb(sampled, "mtp_sampled_token", -1);
+    ggml_build_forward_expand(gf, sampled);
+    res->t_sampled_token = sampled;
 }
