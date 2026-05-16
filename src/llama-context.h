@@ -456,6 +456,24 @@ private:
     int                      tap_n_seq_max      = 0; // set by init_tap_layers
     bool                     tap_merge_on_close = false; // concat s*.bin → h_l<L>.bin on destroy
 
+    // Per-layer staging buffers: filled eagerly during graph execution via eval callback
+    // before ggml's memory allocator can reuse the tensor buffer.
+    // tap_staged[layer_idx] holds f16 data for the most recent ubatch.
+    struct tap_staged_t {
+        std::vector<ggml_fp16_t> data;
+        uint32_t                 n_tokens = 0;
+    };
+    std::vector<tap_staged_t> tap_staged;
+
+    // User-data bundle passed to tap eval callback; kept as a member so its
+    // lifetime covers the graph_compute() call that uses it.
+    struct tap_eval_ud_t {
+        llama_context *                  lctx    = nullptr;
+        ggml_backend_sched_eval_callback user_cb = nullptr;
+        void *                           user_ud = nullptr;
+    };
+    tap_eval_ud_t tap_eval_ud;
+
     // Called from process_ubatch after graph_compute returns GGML_STATUS_SUCCESS.
     void write_tap_layers_post_compute(ggml_cgraph * gf, const llama_ubatch & ubatch);
 };

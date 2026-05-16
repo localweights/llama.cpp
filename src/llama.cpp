@@ -514,8 +514,8 @@ int llama_model_load_mtp_from_file(struct llama_model * model, const char * path
     }
 
     tgt->mtp_assistant.reset(aux);
-    LLAMA_LOG_INFO("%s: loaded gemma4_assistant from '%s' (n_layer=%d, n_embd=%d)\n",
-            __func__, path_mtp, (int) aux->hparams.n_layer, (int) aux->hparams.n_embd);
+    LLAMA_LOG_INFO("%s: loaded %s from '%s' (n_layer=%d, n_embd=%d)\n",
+            __func__, llm_arch_name(aux->arch), path_mtp, (int) aux->hparams.n_layer, (int) aux->hparams.n_embd);
     return 0;
 }
 

@@ -1713,37 +1713,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_build_forward_expand(gf, experts);
 
-    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
-
     assert(n_expert_used > 0);
 
-    // order the views before the adds
-    // ggml_cont forces contiguous strides — required to prevent CUDA fused-add
-    // (ggml_cuda_op_fused_add) from reading wrong byte offsets when n_tokens > 1.
-    // Affects qwen3moe-mtp prefill (handle_mtp_for_seq); silent KV corruption otherwise.
-    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
-        cur_experts[i] = ggml_cont(ctx0,
-            ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]));
-
-        ggml_build_forward_expand(gf, cur_experts[i]);
-    }
-
-    // aggregate experts
-    // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
-    //       to avoid potentially a large number of add nodes during warmup
+    // Aggregate expert outputs via a single sum_rows kernel instead of
+    // N×ggml_cont + (N-1)×ggml_add (15 kernel launches for N=8).
+    //
+    // experts is [n_embd, n_expert_used, n_tokens].
+    // Permute to [n_expert_used, n_embd, n_tokens] so the expert axis becomes
+    // dim-0 (the "column" dimension that sum_rows reduces over).
+    // sum_rows then produces [1, n_embd, n_tokens] in 1 kernel launch.
+    // Reshape to [n_embd, n_tokens] to match the old moe_out shape.
+    //
+    // Mathematical equivalence: the expert weights were already applied via
+    // ggml_mul before this point, so the remaining operation is a plain
+    // element-wise sum — identical to the previous sequential ggml_add loop.
+    //
+    // note: hparams.n_expert_used is used (not n_expert_used local) to match
+    //       the original warmup-graph stability guarantee from
     //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    ggml_tensor * moe_out = cur_experts[0];
+    ggml_tensor * moe_out = ggml_permute(ctx0, experts, 1, 0, 2, 3); // [n_expert_used, n_embd, n_tokens]
+    moe_out = ggml_cont(ctx0, moe_out);                                // make contiguous (required by sum_rows)
+    moe_out = ggml_sum_rows(ctx0, moe_out);                            // [1, n_embd, n_tokens]
+    moe_out = ggml_reshape_2d(ctx0, moe_out, n_embd, n_tokens);        // [n_embd, n_tokens]
 
-    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
-
-        ggml_build_forward_expand(gf, moe_out);
-    }
-
-    if (hparams.n_expert_used == 1) {
-        // avoid returning a non-contiguous tensor
-        moe_out = ggml_cont(ctx0, moe_out);
-    }
+    ggml_build_forward_expand(gf, moe_out);
 
     cb(moe_out, "ffn_moe_out", il);
 

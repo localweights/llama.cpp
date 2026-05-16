@@ -2082,8 +2082,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm;
     if (params.gtype == LLM_GRAPH_TYPE_MTP && mtp_assistant) {
-        // Gemma 4 MTP: build the draft graph using target model (this) + assistant weights.
-        llm = std::make_unique<llm_build_gemma4_mtp>(*this, *mtp_assistant, params);
+        // Build the draft graph using the target model (this) + assistant
+        // weights. Dispatch on assistant arch.
+        switch (mtp_assistant->arch) {
+            case LLM_ARCH_GEMMA4_ASSISTANT:
+                llm = std::make_unique<llm_build_gemma4_mtp>(*this, *mtp_assistant, params);
+                break;
+            case LLM_ARCH_QWEN3MOE_ASSISTANT:
+                llm = std::make_unique<llm_build_qwen3moe_mtp>(*this, *mtp_assistant, params);
+                break;
+            default:
+                throw std::runtime_error(
+                    std::string("unsupported MTP assistant arch: ") +
+                    llm_arch_name(mtp_assistant->arch));
+        }
     } else {
         llm = build_arch_graph(params);
     }
@@ -2309,6 +2321,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_GEMMA4:
         case LLM_ARCH_GEMMA4_ASSISTANT:
+        case LLM_ARCH_QWEN3MOE_ASSISTANT:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_STARCODER2:
         case LLM_ARCH_OPENELM:

@@ -1,0 +1,1376 @@
+
+# 2026-05-14 09:20:19.106113
++**Worktree:** /mnt/scratch/llama-upstream-wt
++**File:** src/llama-context.cpp
++
++## Goal
++
++Generalize `llama_context::decode_mtp()` so it works for non-ISWA target architectures (e.g. qwen3moe), not just gemma4 (which uses `llama_kv_cache_iswa`).
++
++Currently `decode_mtp` casts the context's `memory` to `llama_kv_cache_iswa *` and returns -3 if the cast fails. Eagle qwen3moe_assistant targets a Qwen3MoE base whose memory is a plain `llama_kv_cache`, not iswa. The cast must go.
++
++## Reference
++
++Read `src/llama-context.cpp` around `int32_t llama_context::decode_mtp(`. Existing relevant lines:
++
++```cpp
++auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
++if (!kv_iswa) {
++    LLAMA_LOG_ERROR("%s: MTP requires llama_kv_cache_iswa memory (Gemma 4 target)\n", __func__);
++    return -3;
++}
++...
++auto mctx_up = kv_iswa->init_full();
++```
++
++`llama_memory_i` (the base interface for `memory`) already exposes `init_full()` virtually — see `src/llama-memory.h:87`. So we can call `memory->init_full()` directly.
++
++## Exact changes
++
++In `src/llama-context.cpp` inside `int32_t llama_context::decode_mtp(...)`:
++
++1. **Remove** the `kv_iswa` dynamic_cast block AND the `-3` error return entirely.
++2. **Replace** the per-step call `auto mctx_up = kv_iswa->init_full();` with `auto mctx_up = memory->init_full();`.
++3. Keep everything else exactly as-is:
++   - `n_outputs = 1;` save/restore
++   - `process_ubatch(... LLM_GRAPH_TYPE_MTP, ..., /*apply_mctx=*/false);` (already false — leave it)
++   - `cparams.flash_attn = false;` save/restore (already there for #111 e4b fix — leave it)
++   - `ggml_backend_sched_synchronize` + `ggml_backend_tensor_get` from `res->t_logits` and `res->t_embd`
++   - n_steps loop
++
++## Acceptance
++
++1. `git diff src/llama-context.cpp` shows ~5-10 lines removed (the cast + error path) and 1 line changed (the init_full call).
++2. `docker exec crucible-proxy bash -c 'cd /mnt/scratch/llama-upstream-wt/build-cuda && cmake --build . --target llama-server -j 16'` succeeds, no errors.
++3. Live binary smoke: launch with gemma-4-31b + mtp-head and run one chat completion. Must still produce coherent output and trigger gemma4_drafter as before — this change is a regression risk for the working gemma path.
++
++```bash
++docker exec crucible-proxy /usr/bin/curl -sS http://localhost:9000/unload >/dev/null 2>&1
++sleep 4
++/usr/bin/curl -sS -m 60 -X POST http://localhost:4000/v1/chat/completions \
++  -H 'Content-Type: application/json' \
++  -d '{"model":"crucible/gemma-4-31b-mtp","messages":[{"role":"user","content":"Hi, list 3 colors."}],"max_tokens":40,"temperature":0.2,"stream":false}'
++```
++Expect a non-error JSON response with content (e.g. "1. Blue 2. Red 3. Green").
++
++## Out of scope
++
++- Do NOT touch `common/speculative.cpp`, `src/models/`, `src/llama-arch.*`, or any other files.
++- Do NOT add `qwen3moe_assistant` dispatch. Separate task.
++- Do NOT modify `llama_memory_i` or any KV cache class.
++
++## Notes
++
++This is a tiny edit. Just delete one if-block, change one method call. The complexity is ensuring you don't break the gemma path — verify via the smoke command above.
+
+# 2026-05-14 09:20:19.106161
++**Worktree:** /mnt/scratch/llama-upstream-wt
++**File:** src/llama-context.cpp
++
++## Goal
++
++Generalize `llama_context::decode_mtp()` so it works for non-ISWA target architectures (e.g. qwen3moe), not just gemma4 (which uses `llama_kv_cache_iswa`).
++
++Currently `decode_mtp` casts the context's `memory` to `llama_kv_cache_iswa *` and returns -3 if the cast fails. Eagle qwen3moe_assistant targets a Qwen3MoE base whose memory is a plain `llama_kv_cache`, not iswa. The cast must go.
++
++## Reference
++
++Read `src/llama-context.cpp` around `int32_t llama_context::decode_mtp(`. Existing relevant lines:
++
++```cpp
++auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
++if (!kv_iswa) {
++    LLAMA_LOG_ERROR("%s: MTP requires llama_kv_cache_iswa memory (Gemma 4 target)\n", __func__);
++    return -3;
++}
++...
++auto mctx_up = kv_iswa->init_full();
++```
++
++`llama_memory_i` (the base interface for `memory`) already exposes `init_full()` virtually — see `src/llama-memory.h:87`. So we can call `memory->init_full()` directly.
++
++## Exact changes
++
++In `src/llama-context.cpp` inside `int32_t llama_context::decode_mtp(...)`:
++
++1. **Remove** the `kv_iswa` dynamic_cast block AND the `-3` error return entirely.
++2. **Replace** the per-step call `auto mctx_up = kv_iswa->init_full();` with `auto mctx_up = memory->init_full();`.
++3. Keep everything else exactly as-is:
++   - `n_outputs = 1;` save/restore
++   - `process_ubatch(... LLM_GRAPH_TYPE_MTP, ..., /*apply_mctx=*/false);` (already false — leave it)
++   - `cparams.flash_attn = false;` save/restore (already there for #111 e4b fix — leave it)
++   - `ggml_backend_sched_synchronize` + `ggml_backend_tensor_get` from `res->t_logits` and `res->t_embd`
++   - n_steps loop
++
++## Acceptance
++
++1. `git diff src/llama-context.cpp` shows ~5-10 lines removed (the cast + error path) and 1 line changed (the init_full call).
++2. `docker exec crucible-proxy bash -c 'cd /mnt/scratch/llama-upstream-wt/build-cuda && cmake --build . --target llama-server -j 16'` succeeds, no errors.
++3. Live binary smoke: launch with gemma-4-31b + mtp-head and run one chat completion. Must still produce coherent output and trigger gemma4_drafter as before — this change is a regression risk for the working gemma path.
++
++```bash
++docker exec crucible-proxy /usr/bin/curl -sS http://localhost:9000/unload >/dev/null 2>&1
++sleep 4
++/usr/bin/curl -sS -m 60 -X POST http://localhost:4000/v1/chat/completions \
++  -H 'Content-Type: application/json' \
++  -d '{"model":"crucible/gemma-4-31b-mtp","messages":[{"role":"user","content":"Hi, list 3 colors."}],"max_tokens":40,"temperature":0.2,"stream":false}'
++```
++Expect a non-error JSON response with content (e.g. "1. Blue 2. Red 3. Green").
++
++## Out of scope
++
++- Do NOT touch `common/speculative.cpp`, `src/models/`, `src/llama-arch.*`, or any other files.
++- Do NOT add `qwen3moe_assistant` dispatch. Separate task.
++- Do NOT modify `llama_memory_i` or any KV cache class.
++
++## Notes
++
++This is a tiny edit. Just delete one if-block, change one method call. The complexity is ensuring you don't break the gemma path — verify via the smoke command above.
+
+# 2026-05-14 09:32:19.421893
++**Worktree:** /mnt/scratch/llama-upstream-wt
++**File:** src/llama-context.cpp
++
++## Goal
++
++Generalize `llama_context::decode_mtp()` so it works for non-ISWA target architectures (e.g. qwen3moe), not just gemma4 (which uses `llama_kv_cache_iswa`).
++
++Currently `decode_mtp` casts the context's `memory` to `llama_kv_cache_iswa *` and returns -3 if the cast fails. Eagle qwen3moe_assistant targets a Qwen3MoE base whose memory is a plain `llama_kv_cache`, not iswa. The cast must go.
++
++## Reference
++
++Read `src/llama-context.cpp` around `int32_t llama_context::decode_mtp(`. Existing relevant lines:
++
++```cpp
++auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
++if (!kv_iswa) {
++    LLAMA_LOG_ERROR("%s: MTP requires llama_kv_cache_iswa memory (Gemma 4 target)\n", __func__);
++    return -3;
++}
++...
++auto mctx_up = kv_iswa->init_full();
++```
++
++`llama_memory_i` (the base interface for `memory`) already exposes `init_full()` virtually — see `src/llama-memory.h:87`. So we can call `memory->init_full()` directly.
++
++## Exact changes
++
++In `src/llama-context.cpp` inside `int32_t llama_context::decode_mtp(...)`:
++
++1. **Remove** the `kv_iswa` dynamic_cast block AND the `-3` error return entirely.
++2. **Replace** the per-step call `auto mctx_up = kv_iswa->init_full();` with `auto mctx_up = memory->init_full();`.
++3. Keep everything else exactly as-is:
++   - `n_outputs = 1;` save/restore
++   - `process_ubatch(... LLM_GRAPH_TYPE_MTP, ..., /*apply_mctx=*/false);` (already false — leave it)
++   - `cparams.flash_attn = false;` save/restore (already there for #111 e4b fix — leave it)
++   - `ggml_backend_sched_synchronize` + `ggml_backend_tensor_get` from `res->t_logits` and `res->t_embd`
++   - n_steps loop
++
++## Acceptance
++
++1. `git diff src/llama-context.cpp` shows ~5-10 lines removed (the cast + error path) and 1 line changed (the init_full call).
++2. `docker exec crucible-proxy bash -c 'cd /mnt/scratch/llama-upstream-wt/build-cuda && cmake --build . --target llama-server -j 16'` succeeds, no errors.
++3. Live binary smoke: launch with gemma-4-31b + mtp-head and run one chat completion. Must still produce coherent output and trigger gemma4_drafter as before — this change is a regression risk for the working gemma path.
++
++```bash
++docker exec crucible-proxy /usr/bin/curl -sS http://localhost:9000/unload >/dev/null 2>&1
++sleep 4
++/usr/bin/curl -sS -m 60 -X POST http://localhost:4000/v1/chat/completions \
++  -H 'Content-Type: application/json' \
++  -d '{"model":"crucible/gemma-4-31b-mtp","messages":[{"role":"user","content":"Hi, list 3 colors."}],"max_tokens":40,"temperature":0.2,"stream":false}'
++```
++Expect a non-error JSON response with content (e.g. "1. Blue 2. Red 3. Green").
++
++## Out of scope
++
++- Do NOT touch `common/speculative.cpp`, `src/models/`, `src/llama-arch.*`, or any other files.
++- Do NOT add `qwen3moe_assistant` dispatch. Separate task.
++- Do NOT modify `llama_memory_i` or any KV cache class.
++
++## Notes
++
++This is a tiny edit. Just delete one if-block, change one method call. The complexity is ensuring you don't break the gemma path — verify via the smoke command above.
+
+# 2026-05-14 09:32:19.490802
++**Worktree:** /mnt/scratch/llama-upstream-wt
++**File:** src/llama-context.cpp
++
++## Goal
++
++Generalize `llama_context::decode_mtp()` so it works for non-ISWA target architectures (e.g. qwen3moe), not just gemma4 (which uses `llama_kv_cache_iswa`).
++
++Currently `decode_mtp` casts the context's `memory` to `llama_kv_cache_iswa *` and returns -3 if the cast fails. Eagle qwen3moe_assistant targets a Qwen3MoE base whose memory is a plain `llama_kv_cache`, not iswa. The cast must go.
++
++## Reference
++
++Read `src/llama-context.cpp` around `int32_t llama_context::decode_mtp(`. Existing relevant lines:
++
++```cpp
++auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
++if (!kv_iswa) {
++    LLAMA_LOG_ERROR("%s: MTP requires llama_kv_cache_iswa memory (Gemma 4 target)\n", __func__);
++    return -3;
++}
++...
++auto mctx_up = kv_iswa->init_full();
++```
++
++`llama_memory_i` (the base interface for `memory`) already exposes `init_full()` virtually — see `src/llama-memory.h:87`. So we can call `memory->init_full()` directly.
++
++## Exact changes
++
++In `src/llama-context.cpp` inside `int32_t llama_context::decode_mtp(...)`:
++
++1. **Remove** the `kv_iswa` dynamic_cast block AND the `-3` error return entirely.
++2. **Replace** the per-step call `auto mctx_up = kv_iswa->init_full();` with `auto mctx_up = memory->init_full();`.
++3. Keep everything else exactly as-is:
++   - `n_outputs = 1;` save/restore
++   - `process_ubatch(... LLM_GRAPH_TYPE_MTP, ..., /*apply_mctx=*/false);` (already false — leave it)
++   - `cparams.flash_attn = false;` save/restore (already there for #111 e4b fix — leave it)
++   - `ggml_backend_sched_synchronize` + `ggml_backend_tensor_get` from `res->t_logits` and `res->t_embd`
++   - n_steps loop
++
++## Acceptance
++
++1. `git diff src/llama-context.cpp` shows ~5-10 lines removed (the cast + error path) and 1 line changed (the init_full call).
++2. `docker exec crucible-proxy bash -c 'cd /mnt/scratch/llama-upstream-wt/build-cuda && cmake --build . --target llama-server -j 16'` succeeds, no errors.
++3. Live binary smoke: launch with gemma-4-31b + mtp-head and run one chat completion. Must still produce coherent output and trigger gemma4_drafter as before — this change is a regression risk for the working gemma path.
++
++```bash
++docker exec crucible-proxy /usr/bin/curl -sS http://localhost:9000/unload >/dev/null 2>&1
++sleep 4
++/usr/bin/curl -sS -m 60 -X POST http://localhost:4000/v1/chat/completions \
++  -H 'Content-Type: application/json' \
++  -d '{"model":"crucible/gemma-4-31b-mtp","messages":[{"role":"user","content":"Hi, list 3 colors."}],"max_tokens":40,"temperature":0.2,"stream":false}'
++```
++Expect a non-error JSON response with content (e.g. "1. Blue 2. Red 3. Green").
++
++## Out of scope
++
++- Do NOT touch `common/speculative.cpp`, `src/models/`, `src/llama-arch.*`, or any other files.
++- Do NOT add `qwen3moe_assistant` dispatch. Separate task.
++- Do NOT modify `llama_memory_i` or any KV cache class.
++
++## Notes
++
++This is a tiny edit. Just delete one if-block, change one method call. The complexity is ensuring you don't break the gemma path — verify via the smoke command above.
+
+# 2026-05-14 09:43:36.165030
++**Worktree:** /mnt/scratch/llama-upstream-wt
++**File:** src/llama-context.cpp
++
++## Goal
++
++Generalize `llama_context::decode_mtp()` so it works for non-ISWA target architectures (e.g. qwen3moe), not just gemma4 (which uses `llama_kv_cache_iswa`).
++
++Currently `decode_mtp` casts the context's `memory` to `llama_kv_cache_iswa *` and returns -3 if the cast fails. Eagle qwen3moe_assistant targets a Qwen3MoE base whose memory is a plain `llama_kv_cache`, not iswa. The cast must go.
++
++## Reference
++
++Read `src/llama-context.cpp` around `int32_t llama_context::decode_mtp(`. Existing relevant lines:
++
++```cpp
++auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
++if (!kv_iswa) {
++    LLAMA_LOG_ERROR("%s: MTP requires llama_kv_cache_iswa memory (Gemma 4 target)\n", __func__);
++    return -3;
++}
++...
++auto mctx_up = kv_iswa->init_full();
++```
++
++`llama_memory_i` (the base interface for `memory`) already exposes `init_full()` virtually — see `src/llama-memory.h:87`. So we can call `memory->init_full()` directly.
++
++## Exact changes
++
++In `src/llama-context.cpp` inside `int32_t llama_context::decode_mtp(...)`:
++
++1. **Remove** the `kv_iswa` dynamic_cast block AND the `-3` error return entirely.
++2. **Replace** the per-step call `auto mctx_up = kv_iswa->init_full();` with `auto mctx_up = memory->init_full();`.
++3. Keep everything else exactly as-is:
++   - `n_outputs = 1;` save/restore
++   - `process_ubatch(... LLM_GRAPH_TYPE_MTP, ..., /*apply_mctx=*/false);` (already false — leave it)
++   - `cparams.flash_attn = false;` save/restore (already there for #111 e4b fix — leave it)
++   - `ggml_backend_sched_synchronize` + `ggml_backend_tensor_get` from `res->t_logits` and `res->t_embd`
++   - n_steps loop
++
++## Acceptance
++
++1. `git diff src/llama-context.cpp` shows ~5-10 lines removed (the cast + error path) and 1 line changed (the init_full call).
++2. `docker exec crucible-proxy bash -c 'cd /mnt/scratch/llama-upstream-wt/build-cuda && cmake --build . --target llama-server -j 16'` succeeds, no errors.
++3. Live binary smoke: launch with gemma-4-31b + mtp-head and run one chat completion. Must still produce coherent output and trigger gemma4_drafter as before — this change is a regression risk for the working gemma path.
++
++```bash
++docker exec crucible-proxy /usr/bin/curl -sS http://localhost:9000/unload >/dev/null 2>&1
++sleep 4
++/usr/bin/curl -sS -m 60 -X POST http://localhost:4000/v1/chat/completions \
++  -H 'Content-Type: application/json' \
++  -d '{"model":"crucible/gemma-4-31b-mtp","messages":[{"role":"user","content":"Hi, list 3 colors."}],"max_tokens":40,"temperature":0.2,"stream":false}'
++```
++Expect a non-error JSON response with content (e.g. "1. Blue 2. Red 3. Green").
++
++## Out of scope
++
++- Do NOT touch `common/speculative.cpp`, `src/models/`, `src/llama-arch.*`, or any other files.
++- Do NOT add `qwen3moe_assistant` dispatch. Separate task.
++- Do NOT modify `llama_memory_i` or any KV cache class.
++
++## Notes
++
++This is a tiny edit. Just delete one if-block, change one method call. The complexity is ensuring you don't break the gemma path — verify via the smoke command above.
+
+# 2026-05-14 09:43:36.165119
++**Worktree:** /mnt/scratch/llama-upstream-wt
++**File:** src/llama-context.cpp
++
++## Goal
++
++Generalize `llama_context::decode_mtp()` so it works for non-ISWA target architectures (e.g. qwen3moe), not just gemma4 (which uses `llama_kv_cache_iswa`).
++
++Currently `decode_mtp` casts the context's `memory` to `llama_kv_cache_iswa *` and returns -3 if the cast fails. Eagle qwen3moe_assistant targets a Qwen3MoE base whose memory is a plain `llama_kv_cache`, not iswa. The cast must go.
++
++## Reference
++
++Read `src/llama-context.cpp` around `int32_t llama_context::decode_mtp(`. Existing relevant lines:
++
++```cpp
++auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
++if (!kv_iswa) {
++    LLAMA_LOG_ERROR("%s: MTP requires llama_kv_cache_iswa memory (Gemma 4 target)\n", __func__);
++    return -3;
++}
++...
++auto mctx_up = kv_iswa->init_full();
++```
++
++`llama_memory_i` (the base interface for `memory`) already exposes `init_full()` virtually — see `src/llama-memory.h:87`. So we can call `memory->init_full()` directly.
++
++## Exact changes
++
++In `src/llama-context.cpp` inside `int32_t llama_context::decode_mtp(...)`:
++
++1. **Remove** the `kv_iswa` dynamic_cast block AND the `-3` error return entirely.
++2. **Replace** the per-step call `auto mctx_up = kv_iswa->init_full();` with `auto mctx_up = memory->init_full();`.
++3. Keep everything else exactly as-is:
++   - `n_outputs = 1;` save/restore
++   - `process_ubatch(... LLM_GRAPH_TYPE_MTP, ..., /*apply_mctx=*/false);` (already false — leave it)
++   - `cparams.flash_attn = false;` save/restore (already there for #111 e4b fix — leave it)
++   - `ggml_backend_sched_synchronize` + `ggml_backend_tensor_get` from `res->t_logits` and `res->t_embd`
++   - n_steps loop
++
++## Acceptance
++
++1. `git diff src/llama-context.cpp` shows ~5-10 lines removed (the cast + error path) and 1 line changed (the init_full call).
++2. `docker exec crucible-proxy bash -c 'cd /mnt/scratch/llama-upstream-wt/build-cuda && cmake --build . --target llama-server -j 16'` succeeds, no errors.
++3. Live binary smoke: launch with gemma-4-31b + mtp-head and run one chat completion. Must still produce coherent output and trigger gemma4_drafter as before — this change is a regression risk for the working gemma path.
++
++```bash
++docker exec crucible-proxy /usr/bin/curl -sS http://localhost:9000/unload >/dev/null 2>&1
++sleep 4
++/usr/bin/curl -sS -m 60 -X POST http://localhost:4000/v1/chat/completions \
++  -H 'Content-Type: application/json' \
++  -d '{"model":"crucible/gemma-4-31b-mtp","messages":[{"role":"user","content":"Hi, list 3 colors."}],"max_tokens":40,"temperature":0.2,"stream":false}'
++```
++Expect a non-error JSON response with content (e.g. "1. Blue 2. Red 3. Green").
++
++## Out of scope
++
++- Do NOT touch `common/speculative.cpp`, `src/models/`, `src/llama-arch.*`, or any other files.
++- Do NOT add `qwen3moe_assistant` dispatch. Separate task.
++- Do NOT modify `llama_memory_i` or any KV cache class.
++
++## Notes
++
++This is a tiny edit. Just delete one if-block, change one method call. The complexity is ensuring you don't break the gemma path — verify via the smoke command above.
+
+# 2026-05-14 09:48:48.154245
++**Worktree:** /mnt/scratch/llama-upstream-wt
++**File:** common/speculative.cpp
++**File:** common/arg.cpp
++
++## Goal
++
++Wire up the `qwen3moe_assistant` Eagle MTP drafter to the speculative-decoding dispatcher and `--spec-type` CLI flag so it can be selected at server launch.
++
++The arch port (#113) and decode_mtp generalization (#114) are already landed. The only remaining inference-side scaffold is the dispatcher branch + CLI enum value.
++
++## Context
++
++In `common/speculative.cpp` there is an existing dispatcher block for `COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT`:
++
++```cpp
++if (params.type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT) {
++    const llama_model * model_tgt = llama_get_model(ctx_tgt);
++    if (!llama_model_has_mtp_assistant(model_tgt)) {
++        if (params.draft.mparams.path.empty()) {
++            LOG_ERR("%s: --spec-type gemma4_assistant requires --mtp-head (or --model-draft) pointing at the assistant GGUF\n", __func__);
++            ...
++        }
++        llama_model * model_tgt_mut = const_cast<llama_model *>(model_tgt);
++        llama_model_params mtp_mparams = llama_model_default_params();
++        mtp_mparams.n_gpu_layers = params.draft.n_gpu_layers > 0
++            ? params.draft.n_gpu_layers
++            : 999;
++        const int rc = llama_model_load_mtp_from_file(model_tgt_mut, params.draft.mparams.path.c_str(), mtp_mparams);
++        ...
++    }
++}
++```
++
++The state struct `common_speculative_state_gemma4_assistant` is **already arch-agnostic** (post #111 — reads via `t_h_pre_norm` tap which is wired on qwen3moe target too). So we DON'T need a separate `common_speculative_state_qwen3moe_assistant` struct. Reuse it.
++
++## Exact changes
++
++### 1. `common/speculative.h` — add enum value
++
++Find `enum common_speculative_type` (or wherever `COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT` is declared). Add immediately after it:
++
++```cpp
++COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT,
++```
++
++Also find the `common_speculative_types[]` array (string ↔ enum map) in `common/speculative.cpp` and add the row `{ COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT, "qwen3_assistant" }` next to the gemma4_assistant row. Read the file first to find exact location.
++
++### 2. `common/speculative.cpp` — extend dispatcher block
++
++In `common_speculative_init`, find the `if (params.type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT)` block (around line 1666 in current tree).
++
++Change the condition to handle BOTH gemma4 and qwen3 assistant types:
++
++```cpp
++if (params.type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT ||
++    params.type == COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT) {
++    ...
++}
++```
++
++Update the error message to mention both types:
++```cpp
++LOG_ERR("%s: --spec-type {gemma4_assistant,qwen3_assistant} requires --mtp-head (or --model-draft) pointing at the assistant GGUF\n", __func__);
++```
++
++Keep the body otherwise identical — load_mtp_from_file works for either arch (the GGUF metadata declares which one).
++
++### 3. `common/speculative.cpp` — extend impl-selection switch
++
++There is a `configs` vector / switch later in `common_speculative_init` that creates the impl based on `params.type`:
++
++```cpp
++case COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT:
++    configs.push_back({COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT, ...});
++    break;
++```
++
++Add a parallel `case COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT` that constructs the SAME state struct (`common_speculative_state_gemma4_assistant`) — the struct is already arch-agnostic. Find the existing case and mirror it, just swap the enum tag.
++
++If there is a factory function like `make_state_gemma4_assistant(ctx_tgt)` that returns the impl, reuse it for the qwen3_assistant case too.
++
++### 4. `common/arg.cpp` — extend `--spec-type` CLI
++
++Find the `add_opt(common_arg({"--spec-type"}, ...))` block (around line 3582 in current tree). Read the `[](common_params & params, const std::string & value)` body. It has a chain like:
++
++```cpp
++if (value == "none") { params.speculative.type = COMMON_SPECULATIVE_TYPE_NONE; }
++else if (value == "mtp") { ... }
++else if (value == "gemma4_assistant") { params.speculative.type = COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT; }
++else if (value == "ngram-cache") { ... }
++...
++```
++
++Add a new branch:
++```cpp
++else if (value == "qwen3_assistant") { params.speculative.type = COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT; }
++```
++
++Place it adjacent to the gemma4_assistant branch.
++
++Also update the help-string enum list in the `string_format(...)` for `--spec-type` — find the `[none|mtp|gemma4_assistant|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]` part and insert `qwen3_assistant` after `gemma4_assistant`.
++
++## Acceptance gates
++
++1. `docker exec crucible-proxy bash -c 'cd /mnt/scratch/llama-upstream-wt/build-cuda && cmake --build . --target llama-server -j 16'` succeeds — no errors.
++2. `/mnt/scratch/llama-upstream-wt/build-cuda/bin/llama-server --help 2>&1 | grep -A2 'spec-type'` must show `qwen3_assistant` in the enum list.
++3. `git diff --stat` shows only `common/speculative.h`, `common/speculative.cpp`, `common/arg.cpp` modified.
++4. The existing gemma4_assistant code path must remain unchanged in behavior (regression risk — we're sharing the dispatcher block).
++
++## Out of scope
++
++- Do NOT add a new state struct. Reuse `common_speculative_state_gemma4_assistant`.
++- Do NOT modify `src/models/`, `src/llama-arch.*`, `src/llama-context.cpp`, or any KV cache class.
++- Do NOT attempt to test inference. No trained qwen3_assistant head exists yet.
++
++## Notes
++
++If you can't find an arch-specific factory in step 3 and the existing code constructs `common_speculative_state_gemma4_assistant` inline, copy that inline construction into the new case verbatim. The struct's behavior is the same regardless of which target arch it attaches to (post #111).
+
+# 2026-05-14 09:48:48.154380
++**Worktree:** /mnt/scratch/llama-upstream-wt
++**File:** common/speculative.cpp
++**File:** common/arg.cpp
++
++## Goal
++
++Wire up the `qwen3moe_assistant` Eagle MTP drafter to the speculative-decoding dispatcher and `--spec-type` CLI flag so it can be selected at server launch.
++
++The arch port (#113) and decode_mtp generalization (#114) are already landed. The only remaining inference-side scaffold is the dispatcher branch + CLI enum value.
++
++## Context
++
++In `common/speculative.cpp` there is an existing dispatcher block for `COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT`:
++
++```cpp
++if (params.type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT) {
++    const llama_model * model_tgt = llama_get_model(ctx_tgt);
++    if (!llama_model_has_mtp_assistant(model_tgt)) {
++        if (params.draft.mparams.path.empty()) {
++            LOG_ERR("%s: --spec-type gemma4_assistant requires --mtp-head (or --model-draft) pointing at the assistant GGUF\n", __func__);
++            ...
++        }
++        llama_model * model_tgt_mut = const_cast<llama_model *>(model_tgt);
++        llama_model_params mtp_mparams = llama_model_default_params();
++        mtp_mparams.n_gpu_layers = params.draft.n_gpu_layers > 0
++            ? params.draft.n_gpu_layers
++            : 999;
++        const int rc = llama_model_load_mtp_from_file(model_tgt_mut, params.draft.mparams.path.c_str(), mtp_mparams);
++        ...
++    }
++}
++```
++
++The state struct `common_speculative_state_gemma4_assistant` is **already arch-agnostic** (post #111 — reads via `t_h_pre_norm` tap which is wired on qwen3moe target too). So we DON'T need a separate `common_speculative_state_qwen3moe_assistant` struct. Reuse it.
++
++## Exact changes
++
++### 1. `common/speculative.h` — add enum value
++
++Find `enum common_speculative_type` (or wherever `COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT` is declared). Add immediately after it:
++
++```cpp
++COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT,
++```
++
++Also find the `common_speculative_types[]` array (string ↔ enum map) in `common/speculative.cpp` and add the row `{ COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT, "qwen3_assistant" }` next to the gemma4_assistant row. Read the file first to find exact location.
++
++### 2. `common/speculative.cpp` — extend dispatcher block
++
++In `common_speculative_init`, find the `if (params.type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT)` block (around line 1666 in current tree).
++
++Change the condition to handle BOTH gemma4 and qwen3 assistant types:
++
++```cpp
++if (params.type == COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT ||
++    params.type == COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT) {
++    ...
++}
++```
++
++Update the error message to mention both types:
++```cpp
++LOG_ERR("%s: --spec-type {gemma4_assistant,qwen3_assistant} requires --mtp-head (or --model-draft) pointing at the assistant GGUF\n", __func__);
++```
++
++Keep the body otherwise identical — load_mtp_from_file works for either arch (the GGUF metadata declares which one).
++
++### 3. `common/speculative.cpp` — extend impl-selection switch
++
++There is a `configs` vector / switch later in `common_speculative_init` that creates the impl based on `params.type`:
++
++```cpp
++case COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT:
++    configs.push_back({COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT, ...});
++    break;
++```
++
++Add a parallel `case COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT` that constructs the SAME state struct (`common_speculative_state_gemma4_assistant`) — the struct is already arch-agnostic. Find the existing case and mirror it, just swap the enum tag.
++
++If there is a factory function like `make_state_gemma4_assistant(ctx_tgt)` that returns the impl, reuse it for the qwen3_assistant case too.
++
++### 4. `common/arg.cpp` — extend `--spec-type` CLI
++
++Find the `add_opt(common_arg({"--spec-type"}, ...))` block (around line 3582 in current tree). Read the `[](common_params & params, const std::string & value)` body. It has a chain like:
++
++```cpp
++if (value == "none") { params.speculative.type = COMMON_SPECULATIVE_TYPE_NONE; }
++else if (value == "mtp") { ... }
++else if (value == "gemma4_assistant") { params.speculative.type = COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT; }
++else if (value == "ngram-cache") { ... }
++...
++```
++
++Add a new branch:
++```cpp
++else if (value == "qwen3_assistant") { params.speculative.type = COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT; }
++```
++
++Place it adjacent to the gemma4_assistant branch.
++
++Also update the help-string enum list in the `string_format(...)` for `--spec-type` — find the `[none|mtp|gemma4_assistant|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]` part and insert `qwen3_assistant` after `gemma4_assistant`.
++
++## Acceptance gates
++
++1. `docker exec crucible-proxy bash -c 'cd /mnt/scratch/llama-upstream-wt/build-cuda && cmake --build . --target llama-server -j 16'` succeeds — no errors.
++2. `/mnt/scratch/llama-upstream-wt/build-cuda/bin/llama-server --help 2>&1 | grep -A2 'spec-type'` must show `qwen3_assistant` in the enum list.
++3. `git diff --stat` shows only `common/speculative.h`, `common/speculative.cpp`, `common/arg.cpp` modified.
++4. The existing gemma4_assistant code path must remain unchanged in behavior (regression risk — we're sharing the dispatcher block).
++
++## Out of scope
++
++- Do NOT add a new state struct. Reuse `common_speculative_state_gemma4_assistant`.
++- Do NOT modify `src/models/`, `src/llama-arch.*`, `src/llama-context.cpp`, or any KV cache class.
++- Do NOT attempt to test inference. No trained qwen3_assistant head exists yet.
++
++## Notes
++
++If you can't find an arch-specific factory in step 3 and the existing code constructs `common_speculative_state_gemma4_assistant` inline, copy that inline construction into the new case verbatim. The struct's behavior is the same regardless of which target arch it attaches to (post #111).
+
+# 2026-05-15 08:24:53.765068
++**Worktree:** /mnt/scratch/llama-upstream-wt
++**File:** src/models/qwen3moe-assistant.cpp
++
++## Goal
++Upgrade qwen3moe-assistant.cpp to support MoE FFN in the drafter. Currently hardcoded to dense FFN (build_ffn). Add: load n_expert/n_expert_used/n_ff_exp hparams, load MoE expert tensors per layer (optional — TENSOR_NOT_REQUIRED for backward compat with old dense GGUFs), and use build_moe_ffn when ffn_gate_inp != nullptr.
++
++Also fix the zero-pad comment: the existing pad is already conditional (if n_inner < n_bb), so MoE with n_inner==n_bb simply skips it. No code change needed for pad — just remove the incorrect ASSERT that forbids MoE.
++
++## Reference
++Read the full file. Key sections to change:
++1. `load_arch_hparams` — add 3 KV reads
++2. `load_arch_tensors` — add MoE tensor loading (4 tensors per layer, TENSOR_NOT_REQUIRED so old dense GGUFs still load)
++3. Constructor body (`llm_build_qwen3moe_mtp::llm_build_qwen3moe_mtp`) — remove ASSERT, replace build_ffn with conditional build_moe_ffn
++
++## Exact changes
++
++### 1. load_arch_hparams — add MoE hparam reads
++
++The existing function ends with:
++```cpp
++    ml.get_key(LLM_KV_QWEN3MOE_ASSISTANT_N_EMBD_BACKBONE, hparams.n_embd_backbone, false);
++
++    type = LLM_TYPE_UNKNOWN;
++}
++```
++
++Replace with:
++```cpp
++    ml.get_key(LLM_KV_QWEN3MOE_ASSISTANT_N_EMBD_BACKBONE, hparams.n_embd_backbone, false);
++
++    // MoE drafter hparams — absent in old dense GGUFs (default to 0 = dense mode).
++    ml.get_key(LLM_KV_EXPERT_COUNT,               hparams.n_expert,      false);
++    ml.get_key(LLM_KV_EXPERT_USED_COUNT,          hparams.n_expert_used, false);
++    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp,      false);
++
++    type = LLM_TYPE_UNKNOWN;
++}
++```
++
++### 2. load_arch_tensors — add MoE tensors per layer
++
++The existing per-layer loop section:
++```cpp
++        const int64_t n_ff_cur = hparams.n_ff(i);
++
++        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
++        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
++        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
++        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd},   0);
++```
++
++Replace with:
++```cpp
++        const int64_t n_ff_cur = hparams.n_ff(i);
++
++        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
++
++        if (hparams.n_expert > 0) {
++            // MoE drafter path
++            const int64_t n_exp     = (int64_t) hparams.n_expert;
++            const int64_t n_ff_exp  = (int64_t) hparams.n_ff_exp;
++            layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_exp},              TENSOR_NOT_REQUIRED);
++            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_exp},    TENSOR_NOT_REQUIRED);
++            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_exp},    TENSOR_NOT_REQUIRED);
++            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_exp},    TENSOR_NOT_REQUIRED);
++        } else {
++            // Dense drafter path (original)
++            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
++            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
++            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd},   0);
++        }
++```
++
++### 3. Constructor body — remove ASSERT, add conditional MoE FFN
++
++Remove this line entirely:
++```cpp
++        GGML_ASSERT(mtp.layers[il].ffn_gate_inp == nullptr && "qwen3moe_assistant MTP does not support MoE FFN");
++```
++
++Then replace the dense FFN block:
++```cpp
++        cur = build_norm(attn_out, mtp.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
++        cb(cur, "ffn_norm", il);
++
++        cur = build_ffn(cur,
++                mtp.layers[il].ffn_up,   nullptr, nullptr,
++                mtp.layers[il].ffn_gate, nullptr, nullptr,
++                mtp.layers[il].ffn_down, nullptr, nullptr,
++                nullptr,
++                LLM_FFN_GELU, LLM_FFN_PAR, il);
++        cb(cur, "ffn_out", il);
++
++        cur = ggml_add(ctx0, cur, attn_out);
++```
++
++With:
++```cpp
++        cur = build_norm(attn_out, mtp.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
++        cb(cur, "ffn_norm", il);
++
++        if (mtp.layers[il].ffn_gate_inp != nullptr) {
++            const int64_t n_exp      = (int64_t) mtp.hparams.n_expert;
++            const int64_t n_exp_used = (int64_t) mtp.hparams.n_expert_used;
++            cur = build_moe_ffn(cur,
++                    mtp.layers[il].ffn_gate_inp,
++                    mtp.layers[il].ffn_up_exps,
++                    mtp.layers[il].ffn_gate_exps,
++                    mtp.layers[il].ffn_down_exps,
++                    nullptr,
++                    n_exp, n_exp_used,
++                    LLM_FFN_SILU, true,
++                    0.0f,
++                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
++                    il,
++                    nullptr, nullptr,
++                    nullptr, nullptr, nullptr);
++            cb(cur, "ffn_moe_out", il);
++        } else {
++            cur = build_ffn(cur,
++                    mtp.layers[il].ffn_up,   nullptr, nullptr,
++                    mtp.layers[il].ffn_gate, nullptr, nullptr,
++                    mtp.layers[il].ffn_down, nullptr, nullptr,
++                    nullptr,
++                    LLM_FFN_GELU, LLM_FFN_PAR, il);
++            cb(cur, "ffn_out", il);
++        }
++
++        cur = ggml_add(ctx0, cur, attn_out);
++```
++
++## Acceptance
++Build succeeds:
++```bash
++cd /mnt/scratch/llama-upstream-wt/build-cuda && cmake --build . --target llama-server -j 16 2>&1 | tail -5
++```
++Must end with something like: `[100%] Linking CXX executable llama-server` or `[100%] Built target llama-server` with no errors.
++
++## Out of scope
++Do NOT modify any other file. Do NOT change load_arch_hparams beyond adding the 3 KV reads. Do NOT change the attention section, RoPE, or post-projection code.
+
+# 2026-05-15 08:24:53.831846
++**Worktree:** /mnt/scratch/llama-upstream-wt
++**File:** src/models/qwen3moe-assistant.cpp
++
++## Goal
++Upgrade qwen3moe-assistant.cpp to support MoE FFN in the drafter. Currently hardcoded to dense FFN (build_ffn). Add: load n_expert/n_expert_used/n_ff_exp hparams, load MoE expert tensors per layer (optional — TENSOR_NOT_REQUIRED for backward compat with old dense GGUFs), and use build_moe_ffn when ffn_gate_inp != nullptr.
++
++Also fix the zero-pad comment: the existing pad is already conditional (if n_inner < n_bb), so MoE with n_inner==n_bb simply skips it. No code change needed for pad — just remove the incorrect ASSERT that forbids MoE.
++
++## Reference
++Read the full file. Key sections to change:
++1. `load_arch_hparams` — add 3 KV reads
++2. `load_arch_tensors` — add MoE tensor loading (4 tensors per layer, TENSOR_NOT_REQUIRED so old dense GGUFs still load)
++3. Constructor body (`llm_build_qwen3moe_mtp::llm_build_qwen3moe_mtp`) — remove ASSERT, replace build_ffn with conditional build_moe_ffn
++
++## Exact changes
++
++### 1. load_arch_hparams — add MoE hparam reads
++
++The existing function ends with:
++```cpp
++    ml.get_key(LLM_KV_QWEN3MOE_ASSISTANT_N_EMBD_BACKBONE, hparams.n_embd_backbone, false);
++
++    type = LLM_TYPE_UNKNOWN;
++}
++```
++
++Replace with:
++```cpp
++    ml.get_key(LLM_KV_QWEN3MOE_ASSISTANT_N_EMBD_BACKBONE, hparams.n_embd_backbone, false);
++
++    // MoE drafter hparams — absent in old dense GGUFs (default to 0 = dense mode).
++    ml.get_key(LLM_KV_EXPERT_COUNT,               hparams.n_expert,      false);
++    ml.get_key(LLM_KV_EXPERT_USED_COUNT,          hparams.n_expert_used, false);
++    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp,      false);
++
++    type = LLM_TYPE_UNKNOWN;
++}
++```
++
++### 2. load_arch_tensors — add MoE tensors per layer
++
++The existing per-layer loop section:
++```cpp
++        const int64_t n_ff_cur = hparams.n_ff(i);
++
++        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
++        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
++        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
++        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd},   0);
++```
++
++Replace with:
++```cpp
++        const int64_t n_ff_cur = hparams.n_ff(i);
++
++        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
++
++        if (hparams.n_expert > 0) {
++            // MoE drafter path
++            const int64_t n_exp     = (int64_t) hparams.n_expert;
++            const int64_t n_ff_exp  = (int64_t) hparams.n_ff_exp;
++            layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_exp},              TENSOR_NOT_REQUIRED);
++            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_exp},    TENSOR_NOT_REQUIRED);
++            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_exp},    TENSOR_NOT_REQUIRED);
++            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_exp},    TENSOR_NOT_REQUIRED);
++        } else {
++            // Dense drafter path (original)
++            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
++            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
++            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd},   0);
++        }
++```
++
++### 3. Constructor body — remove ASSERT, add conditional MoE FFN
++
++Remove this line entirely:
++```cpp
++        GGML_ASSERT(mtp.layers[il].ffn_gate_inp == nullptr && "qwen3moe_assistant MTP does not support MoE FFN");
++```
++
++Then replace the dense FFN block:
++```cpp
++        cur = build_norm(attn_out, mtp.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
++        cb(cur, "ffn_norm", il);
++
++        cur = build_ffn(cur,
++                mtp.layers[il].ffn_up,   nullptr, nullptr,
++                mtp.layers[il].ffn_gate, nullptr, nullptr,
++                mtp.layers[il].ffn_down, nullptr, nullptr,
++                nullptr,
++                LLM_FFN_GELU, LLM_FFN_PAR, il);
++        cb(cur, "ffn_out", il);
++
++        cur = ggml_add(ctx0, cur, attn_out);
++```
++
++With:
++```cpp
++        cur = build_norm(attn_out, mtp.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
++        cb(cur, "ffn_norm", il);
++
++        if (mtp.layers[il].ffn_gate_inp != nullptr) {
++            const int64_t n_exp      = (int64_t) mtp.hparams.n_expert;
++            const int64_t n_exp_used = (int64_t) mtp.hparams.n_expert_used;
++            cur = build_moe_ffn(cur,
++                    mtp.layers[il].ffn_gate_inp,
++                    mtp.layers[il].ffn_up_exps,
++                    mtp.layers[il].ffn_gate_exps,
++                    mtp.layers[il].ffn_down_exps,
++                    nullptr,
++                    n_exp, n_exp_used,
++                    LLM_FFN_SILU, true,
++                    0.0f,
++                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
++                    il,
++                    nullptr, nullptr,
++                    nullptr, nullptr, nullptr);
++            cb(cur, "ffn_moe_out", il);
++        } else {
++            cur = build_ffn(cur,
++                    mtp.layers[il].ffn_up,   nullptr, nullptr,
++                    mtp.layers[il].ffn_gate, nullptr, nullptr,
++                    mtp.layers[il].ffn_down, nullptr, nullptr,
++                    nullptr,
++                    LLM_FFN_GELU, LLM_FFN_PAR, il);
++            cb(cur, "ffn_out", il);
++        }
++
++        cur = ggml_add(ctx0, cur, attn_out);
++```
++
++## Acceptance
++Build succeeds:
++```bash
++cd /mnt/scratch/llama-upstream-wt/build-cuda && cmake --build . --target llama-server -j 16 2>&1 | tail -5
++```
++Must end with something like: `[100%] Linking CXX executable llama-server` or `[100%] Built target llama-server` with no errors.
++
++## Out of scope
++Do NOT modify any other file. Do NOT change load_arch_hparams beyond adding the 3 KV reads. Do NOT change the attention section, RoPE, or post-projection code.
+
+# 2026-05-15 19:47:43.012392
++**Worktree:** /mnt/scratch/llama-upstream-wt
++**File:** src/llama-context.cpp
++**File:** src/models/qwen3moe-assistant.cpp
++
++## Goal
++
++Wire Eagle3 3-tap speculative decode into the existing qwen3moe_assistant MTP drafter path.
++Eagle3 detection: `mtp_pre_projection->ne[0] == 3 * n_bb` (3*2048=6144 cols vs Eagle2's 2*2048=4096).
++
++---
++
++## Change 1: llama-context.cpp — `decode_mtp` (around line 2491)
++
++### Reference: existing section near line 2509
++```cpp
++    const int32_t  n_vocab = (int32_t) model.vocab.n_tokens();
++    const uint32_t n_bb    = model.mtp_assistant->hparams.n_embd_backbone;
++    if (n_bb == 0) {
++        LLAMA_LOG_ERROR("%s: assistant missing n_embd_backbone metadata\n", __func__);
++        return -4;
++    }
++
++    // Build a 1-token ubatch shared by all steps
++    auto data = std::make_shared<llama_ubatch::data_t>();
++    data->token.resize(1);
++    data->embd.resize(n_bb);
++```
++
++Replace with:
++```cpp
++    const int32_t  n_vocab = (int32_t) model.vocab.n_tokens();
++    const uint32_t n_bb    = model.mtp_assistant->hparams.n_embd_backbone;
++    if (n_bb == 0) {
++        LLAMA_LOG_ERROR("%s: assistant missing n_embd_backbone metadata\n", __func__);
++        return -4;
++    }
++
++    // Eagle3 detection: pre_projection has 3*n_bb input cols (h_low||h_mid||h_high)
++    // vs Eagle2's 2*n_bb (tok_embd_padded||h_prev). h-states sourced from tap_staged.
++    const uint32_t pre_proj_cols = (uint32_t) model.mtp_assistant->mtp_pre_projection->ne[0];
++    const bool is_eagle3 = (pre_proj_cols == 3 * n_bb);
++    if (is_eagle3 && tap_staged.size() < 3) {
++        LLAMA_LOG_ERROR("%s: Eagle3 requires 3 tap layers; tap_staged.size=%zu\n",
++                        __func__, tap_staged.size());
++        return -5;
++    }
++
++    // Build a 1-token ubatch shared by all steps
++    auto data = std::make_shared<llama_ubatch::data_t>();
++    data->token.resize(1);
++    data->embd.resize(pre_proj_cols);
++```
++
++### Reference: existing section near line 2553
++```cpp
++    llama_token cur_tok = last_token;
++    std::vector<float> hbuf(n_bb);
++    std::memcpy(hbuf.data(), h_prev, n_bb * sizeof(float));
++```
++
++Replace with:
++```cpp
++    llama_token cur_tok = last_token;
++    std::vector<float> hbuf(pre_proj_cols);
++    if (is_eagle3) {
++        // Pack h_low||h_mid||h_high from tap_staged (f16 → f32) at last token pos.
++        // h-states are constant across all draft steps (fixed tap from target pass).
++        for (int ti = 0; ti < 3; ++ti) {
++            const auto & stg = tap_staged[ti];
++            if (stg.data.empty() || stg.n_tokens == 0) {
++                LLAMA_LOG_ERROR("%s: Eagle3 tap_staged[%d] empty\n", __func__, ti);
++                return -6;
++            }
++            const uint32_t last_pos = stg.n_tokens - 1;
++            const ggml_fp16_t * src = stg.data.data() + (size_t) last_pos * n_bb;
++            float * dst = hbuf.data() + (size_t) ti * n_bb;
++            for (uint32_t j = 0; j < n_bb; ++j) {
++                dst[j] = ggml_fp16_to_fp32(src[j]);
++            }
++        }
++    } else {
++        std::memcpy(hbuf.data(), h_prev, n_bb * sizeof(float));
++    }
++```
++
++### Reference: inside the step loop near line 2586
++```cpp
++        data->token[0] = cur_tok;
++        data->pos[0]   = attn_pos + 1 + (llama_pos) step;
++        std::memcpy(data->embd.data(), hbuf.data(), n_bb * sizeof(float));
++```
++
++Replace with:
++```cpp
++        data->token[0] = cur_tok;
++        data->pos[0]   = attn_pos + 1 + (llama_pos) step;
++        std::memcpy(data->embd.data(), hbuf.data(), pre_proj_cols * sizeof(float));
++```
++
++### Reference: post-step h_prev update near line 2652
++```cpp
++        // Extract post-projection hidden for next step
++        if (res->t_embd) {
++            GGML_ASSERT((size_t) res->t_embd->ne[0] == (size_t) n_bb);
++            ggml_backend_tensor_get(res->t_embd, hbuf.data(), 0, n_bb * sizeof(float));
++        }
++```
++
++Replace with:
++```cpp
++        // Extract post-projection hidden for next step (Eagle2 only).
++        // Eagle3: h-states from tap_staged stay constant; no recurrent h_prev.
++        if (!is_eagle3 && res->t_embd) {
++            GGML_ASSERT((size_t) res->t_embd->ne[0] == (size_t) n_bb);
++            ggml_backend_tensor_get(res->t_embd, hbuf.data(), 0, n_bb * sizeof(float));
++        }
++```
++
++---
++
++## Change 2: qwen3moe-assistant.cpp — `llm_build_qwen3moe_mtp` constructor
++
++### Reference: after `GGML_ASSERT(n_bb > 0);` near the constructor body start
++```cpp
++    GGML_ASSERT(n_bb > 0);
++    GGML_ASSERT(mtp.mtp_pre_projection != nullptr && mtp.mtp_post_projection != nullptr);
++
++    ggml_tensor * inp_tok = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
++    ggml_set_input(inp_tok);
++    cb(inp_tok, "mtp_inp_last_token", -1);
++
++    ggml_tensor * inp_h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_bb, 1);
++    ggml_set_input(inp_h);
++    cb(inp_h, "mtp_inp_h_prev", -1);
++```
++
++Replace with:
++```cpp
++    GGML_ASSERT(n_bb > 0);
++    GGML_ASSERT(mtp.mtp_pre_projection != nullptr && mtp.mtp_post_projection != nullptr);
++
++    // Eagle3 detection: pre_projection input cols = 3*n_bb (h_low||h_mid||h_high)
++    const int64_t pre_proj_cols = mtp.mtp_pre_projection->ne[0];
++    const bool is_eagle3 = (pre_proj_cols == 3 * n_bb);
++
++    ggml_tensor * inp_tok = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
++    ggml_set_input(inp_tok);
++    cb(inp_tok, "mtp_inp_last_token", -1);
++
++    ggml_tensor * inp_h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, pre_proj_cols, 1);
++    ggml_set_input(inp_h);
++    cb(inp_h, "mtp_inp_h_prev", -1);
++```
++
++### Reference: the tok_embd + padding + pre_projection section
++```cpp
++    // Eagle drafter has its OWN token embedding (mtp.tok_embd, dim n_embd_inner)
++    // — NOT the target's. Trainer (eagle_head.py EagleHead.forward) uses
++    // self.tok_embd (Embedding(n_vocab, n_embd_inner)) and zero-pads up to
++    // n_embd_backbone before concat with h_prev. C++ must match exactly: any
++    // mismatch in the pre_proj input distribution defeats training entirely
++    // (the pre_proj matrix never sees the same inputs it was optimised on).
++    ggml_tensor * tok_e = ggml_get_rows(ctx0, mtp.tok_embd, inp_tok);
++    cb(tok_e, "mtp_self_tok_embd", -1);
++
++    // tok_e is (n_embd_inner, 1). Zero-pad up to n_embd_backbone along dim 0
++    // so concat with inp_h (n_bb, 1) yields a (2*n_bb, 1) input matching the
++    // (2*n_bb, n_inner) pre_projection matrix.
++    const int64_t n_inner = (int64_t) hparams.n_embd;
++    if (n_inner < (int64_t) n_bb) {
++        ggml_tensor * pad = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) n_bb - n_inner, 1);
++        pad = ggml_scale(ctx0, pad, 0.0f);
++        tok_e = ggml_concat(ctx0, tok_e, pad, 0);
++        cb(tok_e, "mtp_tok_embd_padded", -1);
++    }
++
++    ggml_tensor * inp_cat = ggml_concat(ctx0, tok_e, inp_h, 0);
++    cb(inp_cat, "mtp_concat", -1);
++
++    ggml_tensor * inpL = build_lora_mm(mtp.mtp_pre_projection, inp_cat);
++    cb(inpL, "mtp_pre_proj_out", -1);
++
++    ggml_build_forward_expand(gf, inpL);
++```
++
++Replace with:
++```cpp
++    ggml_tensor * tok_e = ggml_get_rows(ctx0, mtp.tok_embd, inp_tok);
++    cb(tok_e, "mtp_self_tok_embd", -1);
++
++    ggml_tensor * inpL;
++    if (is_eagle3) {
++        // Eagle3: fused = h_proj(cat(h_low, h_mid, h_high)) + tok_embd(token)
++        // inp_h is (3*n_bb, 1), pre_projection is (3*n_bb, n_embd_inner)
++        ggml_tensor * h_fused = build_lora_mm(mtp.mtp_pre_projection, inp_h);
++        cb(h_fused, "mtp_h_fused", -1);
++        inpL = ggml_add(ctx0, h_fused, tok_e);
++        cb(inpL, "mtp_pre_proj_out", -1);
++    } else {
++        // Eagle2: inpL = pre_proj(concat(tok_embd_padded, h_prev))
++        const int64_t n_inner = (int64_t) hparams.n_embd;
++        if (n_inner < (int64_t) n_bb) {
++            ggml_tensor * pad = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) n_bb - n_inner, 1);
++            pad = ggml_scale(ctx0, pad, 0.0f);
++            tok_e = ggml_concat(ctx0, tok_e, pad, 0);
++            cb(tok_e, "mtp_tok_embd_padded", -1);
++        }
++        ggml_tensor * inp_cat = ggml_concat(ctx0, tok_e, inp_h, 0);
++        cb(inp_cat, "mtp_concat", -1);
++        inpL = build_lora_mm(mtp.mtp_pre_projection, inp_cat);
++        cb(inpL, "mtp_pre_proj_out", -1);
++    }
++
++    ggml_build_forward_expand(gf, inpL);
++```
++
++---
++
++## Acceptance
++
++1. `cd /mnt/scratch/llama-upstream-wt/build-cuda && cmake --build . --target llama-server -j 16 2>&1 | tail -5`
++   Must exit 0 with `[100%] Built target llama-server` or similar.
++
++2. `grep -n "is_eagle3" src/llama-context.cpp src/models/qwen3moe-assistant.cpp`
++   Must show hits in both files.
++
++3. No change to Eagle2 behavior: existing `mtp_pre_projection->ne[0] == 2*n_bb` case unchanged.
++
++## Out of scope
++
++Do NOT touch: llama-graph.h, llama-graph.cpp, llama-context.h, llama-arch.h, any other files.
++Do NOT add new exported symbols or new functions beyond what's described.
+
+# 2026-05-15 19:47:43.019775
++**Worktree:** /mnt/scratch/llama-upstream-wt
++**File:** src/llama-context.cpp
++**File:** src/models/qwen3moe-assistant.cpp
++
++## Goal
++
++Wire Eagle3 3-tap speculative decode into the existing qwen3moe_assistant MTP drafter path.
++Eagle3 detection: `mtp_pre_projection->ne[0] == 3 * n_bb` (3*2048=6144 cols vs Eagle2's 2*2048=4096).
++
++---
++
++## Change 1: llama-context.cpp — `decode_mtp` (around line 2491)
++
++### Reference: existing section near line 2509
++```cpp
++    const int32_t  n_vocab = (int32_t) model.vocab.n_tokens();
++    const uint32_t n_bb    = model.mtp_assistant->hparams.n_embd_backbone;
++    if (n_bb == 0) {
++        LLAMA_LOG_ERROR("%s: assistant missing n_embd_backbone metadata\n", __func__);
++        return -4;
++    }
++
++    // Build a 1-token ubatch shared by all steps
++    auto data = std::make_shared<llama_ubatch::data_t>();
++    data->token.resize(1);
++    data->embd.resize(n_bb);
++```
++
++Replace with:
++```cpp
++    const int32_t  n_vocab = (int32_t) model.vocab.n_tokens();
++    const uint32_t n_bb    = model.mtp_assistant->hparams.n_embd_backbone;
++    if (n_bb == 0) {
++        LLAMA_LOG_ERROR("%s: assistant missing n_embd_backbone metadata\n", __func__);
++        return -4;
++    }
++
++    // Eagle3 detection: pre_projection has 3*n_bb input cols (h_low||h_mid||h_high)
++    // vs Eagle2's 2*n_bb (tok_embd_padded||h_prev). h-states sourced from tap_staged.
++    const uint32_t pre_proj_cols = (uint32_t) model.mtp_assistant->mtp_pre_projection->ne[0];
++    const bool is_eagle3 = (pre_proj_cols == 3 * n_bb);
++    if (is_eagle3 && tap_staged.size() < 3) {
++        LLAMA_LOG_ERROR("%s: Eagle3 requires 3 tap layers; tap_staged.size=%zu\n",
++                        __func__, tap_staged.size());
++        return -5;
++    }
++
++    // Build a 1-token ubatch shared by all steps
++    auto data = std::make_shared<llama_ubatch::data_t>();
++    data->token.resize(1);
++    data->embd.resize(pre_proj_cols);
++```
++
++### Reference: existing section near line 2553
++```cpp
++    llama_token cur_tok = last_token;
++    std::vector<float> hbuf(n_bb);
++    std::memcpy(hbuf.data(), h_prev, n_bb * sizeof(float));
++```
++
++Replace with:
++```cpp
++    llama_token cur_tok = last_token;
++    std::vector<float> hbuf(pre_proj_cols);
++    if (is_eagle3) {
++        // Pack h_low||h_mid||h_high from tap_staged (f16 → f32) at last token pos.
++        // h-states are constant across all draft steps (fixed tap from target pass).
++        for (int ti = 0; ti < 3; ++ti) {
++            const auto & stg = tap_staged[ti];
++            if (stg.data.empty() || stg.n_tokens == 0) {
++                LLAMA_LOG_ERROR("%s: Eagle3 tap_staged[%d] empty\n", __func__, ti);
++                return -6;
++            }
++            const uint32_t last_pos = stg.n_tokens - 1;
++            const ggml_fp16_t * src = stg.data.data() + (size_t) last_pos * n_bb;
++            float * dst = hbuf.data() + (size_t) ti * n_bb;
++            for (uint32_t j = 0; j < n_bb; ++j) {
++                dst[j] = ggml_fp16_to_fp32(src[j]);
++            }
++        }
++    } else {
++        std::memcpy(hbuf.data(), h_prev, n_bb * sizeof(float));
++    }
++```
++
++### Reference: inside the step loop near line 2586
++```cpp
++        data->token[0] = cur_tok;
++        data->pos[0]   = attn_pos + 1 + (llama_pos) step;
++        std::memcpy(data->embd.data(), hbuf.data(), n_bb * sizeof(float));
++```
++
++Replace with:
++```cpp
++        data->token[0] = cur_tok;
++        data->pos[0]   = attn_pos + 1 + (llama_pos) step;
++        std::memcpy(data->embd.data(), hbuf.data(), pre_proj_cols * sizeof(float));
++```
++
++### Reference: post-step h_prev update near line 2652
++```cpp
++        // Extract post-projection hidden for next step
++        if (res->t_embd) {
++            GGML_ASSERT((size_t) res->t_embd->ne[0] == (size_t) n_bb);
++            ggml_backend_tensor_get(res->t_embd, hbuf.data(), 0, n_bb * sizeof(float));
++        }
++```
++
++Replace with:
++```cpp
++        // Extract post-projection hidden for next step (Eagle2 only).
++        // Eagle3: h-states from tap_staged stay constant; no recurrent h_prev.
++        if (!is_eagle3 && res->t_embd) {
++            GGML_ASSERT((size_t) res->t_embd->ne[0] == (size_t) n_bb);
++            ggml_backend_tensor_get(res->t_embd, hbuf.data(), 0, n_bb * sizeof(float));
++        }
++```
++
++---
++
++## Change 2: qwen3moe-assistant.cpp — `llm_build_qwen3moe_mtp` constructor
++
++### Reference: after `GGML_ASSERT(n_bb > 0);` near the constructor body start
++```cpp
++    GGML_ASSERT(n_bb > 0);
++    GGML_ASSERT(mtp.mtp_pre_projection != nullptr && mtp.mtp_post_projection != nullptr);
++
++    ggml_tensor * inp_tok = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
++    ggml_set_input(inp_tok);
++    cb(inp_tok, "mtp_inp_last_token", -1);
++
++    ggml_tensor * inp_h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_bb, 1);
++    ggml_set_input(inp_h);
++    cb(inp_h, "mtp_inp_h_prev", -1);
++```
++
++Replace with:
++```cpp
++    GGML_ASSERT(n_bb > 0);
++    GGML_ASSERT(mtp.mtp_pre_projection != nullptr && mtp.mtp_post_projection != nullptr);
++
++    // Eagle3 detection: pre_projection input cols = 3*n_bb (h_low||h_mid||h_high)
++    const int64_t pre_proj_cols = mtp.mtp_pre_projection->ne[0];
++    const bool is_eagle3 = (pre_proj_cols == 3 * n_bb);
++
++    ggml_tensor * inp_tok = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
++    ggml_set_input(inp_tok);
++    cb(inp_tok, "mtp_inp_last_token", -1);
++
++    ggml_tensor * inp_h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, pre_proj_cols, 1);
++    ggml_set_input(inp_h);
++    cb(inp_h, "mtp_inp_h_prev", -1);
++```
++
++### Reference: the tok_embd + padding + pre_projection section
++```cpp
++    // Eagle drafter has its OWN token embedding (mtp.tok_embd, dim n_embd_inner)
++    // — NOT the target's. Trainer (eagle_head.py EagleHead.forward) uses
++    // self.tok_embd (Embedding(n_vocab, n_embd_inner)) and zero-pads up to
++    // n_embd_backbone before concat with h_prev. C++ must match exactly: any
++    // mismatch in the pre_proj input distribution defeats training entirely
++    // (the pre_proj matrix never sees the same inputs it was optimised on).
++    ggml_tensor * tok_e = ggml_get_rows(ctx0, mtp.tok_embd, inp_tok);
++    cb(tok_e, "mtp_self_tok_embd", -1);
++
++    // tok_e is (n_embd_inner, 1). Zero-pad up to n_embd_backbone along dim 0
++    // so concat with inp_h (n_bb, 1) yields a (2*n_bb, 1) input matching the
++    // (2*n_bb, n_inner) pre_projection matrix.
++    const int64_t n_inner = (int64_t) hparams.n_embd;
++    if (n_inner < (int64_t) n_bb) {
++        ggml_tensor * pad = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) n_bb - n_inner, 1);
++        pad = ggml_scale(ctx0, pad, 0.0f);
++        tok_e = ggml_concat(ctx0, tok_e, pad, 0);
++        cb(tok_e, "mtp_tok_embd_padded", -1);
++    }
++
++    ggml_tensor * inp_cat = ggml_concat(ctx0, tok_e, inp_h, 0);
++    cb(inp_cat, "mtp_concat", -1);
++
++    ggml_tensor * inpL = build_lora_mm(mtp.mtp_pre_projection, inp_cat);
++    cb(inpL, "mtp_pre_proj_out", -1);
++
++    ggml_build_forward_expand(gf, inpL);
++```
++
++Replace with:
++```cpp
++    ggml_tensor * tok_e = ggml_get_rows(ctx0, mtp.tok_embd, inp_tok);
++    cb(tok_e, "mtp_self_tok_embd", -1);
++
++    ggml_tensor * inpL;
++    if (is_eagle3) {
++        // Eagle3: fused = h_proj(cat(h_low, h_mid, h_high)) + tok_embd(token)
++        // inp_h is (3*n_bb, 1), pre_projection is (3*n_bb, n_embd_inner)
++        ggml_tensor * h_fused = build_lora_mm(mtp.mtp_pre_projection, inp_h);
++        cb(h_fused, "mtp_h_fused", -1);
++        inpL = ggml_add(ctx0, h_fused, tok_e);
++        cb(inpL, "mtp_pre_proj_out", -1);
++    } else {
++        // Eagle2: inpL = pre_proj(concat(tok_embd_padded, h_prev))
++        const int64_t n_inner = (int64_t) hparams.n_embd;
++        if (n_inner < (int64_t) n_bb) {
++            ggml_tensor * pad = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) n_bb - n_inner, 1);
++            pad = ggml_scale(ctx0, pad, 0.0f);
++            tok_e = ggml_concat(ctx0, tok_e, pad, 0);
++            cb(tok_e, "mtp_tok_embd_padded", -1);
++        }
++        ggml_tensor * inp_cat = ggml_concat(ctx0, tok_e, inp_h, 0);
++        cb(inp_cat, "mtp_concat", -1);
++        inpL = build_lora_mm(mtp.mtp_pre_projection, inp_cat);
++        cb(inpL, "mtp_pre_proj_out", -1);
++    }
++
++    ggml_build_forward_expand(gf, inpL);
++```
++
++---
++
++## Acceptance
++
++1. `cd /mnt/scratch/llama-upstream-wt/build-cuda && cmake --build . --target llama-server -j 16 2>&1 | tail -5`
++   Must exit 0 with `[100%] Built target llama-server` or similar.
++
++2. `grep -n "is_eagle3" src/llama-context.cpp src/models/qwen3moe-assistant.cpp`
++   Must show hits in both files.
++
++3. No change to Eagle2 behavior: existing `mtp_pre_projection->ne[0] == 2*n_bb` case unchanged.
++
++## Out of scope
++
++Do NOT touch: llama-graph.h, llama-graph.cpp, llama-context.h, llama-arch.h, any other files.
++Do NOT add new exported symbols or new functions beyond what's described.

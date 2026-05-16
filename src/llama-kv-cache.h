@@ -388,8 +388,8 @@ public:
 private:
     llama_memory_status status;
 
-    llama_kv_cache * kv;
-    llama_context * lctx;
+    llama_kv_cache * kv     = nullptr;
+    llama_context  * lctx   = nullptr;
 
     //
     // update context

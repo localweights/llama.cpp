@@ -768,6 +768,9 @@ void llama_context::init_tap_layers(const char * dir, const std::vector<int> & l
     tap_n_seq_max      = n_seq_max;
     tap_merge_on_close = merge_on_close && (n_seq_max > 1);
 
+    // Allocate staging buffers (empty until first eval callback fires).
+    tap_staged.resize(layers.size());
+
     // open append-mode binary files: tap_files[layer_idx][seq_idx]
     // n_seq_max == 1 → single file "h_l<L>.bin"  (backward compat)
     // n_seq_max  > 1 → per-seq  "h_l<L>.s<S>.bin"
@@ -838,55 +841,25 @@ void llama_context::init_tap_layers(const char * dir, const std::vector<int> & l
 }
 
 void llama_context::write_tap_layers_post_compute(ggml_cgraph * gf, const llama_ubatch & ubatch) {
-    if (!tap_out_dir || tap_layers.empty() || !gf) {
+    if (!tap_out_dir || tap_layers.empty()) {
         return;
     }
 
-    // Ensure device computation is complete before reading tensor data.
-    // (graph_compute is async; handle_mtp may or may not have synced already.)
-    ggml_backend_sched_synchronize(sched.get());
+    // Data was captured eagerly by the eval callback into tap_staged[] during
+    // graph_compute, before ggml could reuse tensor memory buffers. We now
+    // write those staged buffers to the tap files.
+    // If a layer's staging buffer is empty (e.g. MTP sub-graph that doesn't
+    // contain the tap layer), skip it silently.
 
     const uint32_t n_tokens = ubatch.n_tokens;
 
     for (size_t idx = 0; idx < tap_layers.size(); ++idx) {
-        int L = tap_layers[idx];
-        char tname[64];
-        std::snprintf(tname, sizeof(tname), "l_out-%d", L);
-
-        ggml_tensor * t = nullptr;
-        const int n_nodes = ggml_graph_n_nodes(gf);
-        for (int i = 0; i < n_nodes; ++i) {
-            ggml_tensor * node = ggml_graph_node(gf, i);
-            if (node && std::strcmp(node->name, tname) == 0) {
-                t = node;
-                break;
-            }
+        const auto & stg = tap_staged[idx];
+        if (stg.data.empty()) {
+            continue; // tensor absent from this graph (e.g. MTP graph)
         }
-
-        if (!t) {
-            // tensor absent from this graph (e.g. MTP graph) — skip silently
-            continue;
-        }
-
-        // Tensor shape: [n_embd, n_tokens] (f32 on device).
-        const size_t nbytes_f32 = ggml_nbytes(t);
-        const size_t n_elem     = nbytes_f32 / sizeof(float);
-
-        // copy device → host
-        std::vector<uint8_t> host(nbytes_f32);
-        ggml_backend_t bk = ggml_backend_sched_get_tensor_backend(sched.get(), t);
-        if (!bk) {
-            LLAMA_LOG_WARN("%s: no backend for tensor '%s', skipping\n", __func__, tname);
-            continue;
-        }
-        ggml_backend_tensor_get(t, host.data(), 0, nbytes_f32);
-
-        // convert f32 → f16 (full tensor)
-        const float * f32_ptr = reinterpret_cast<const float *>(host.data());
-        std::vector<ggml_fp16_t> f16_buf(n_elem);
-        for (size_t e = 0; e < n_elem; ++e) {
-            f16_buf[e] = ggml_fp32_to_fp16(f32_ptr[e]);
-        }
+        const size_t n_elem    = stg.data.size();
+        const auto & f16_buf   = stg.data;
 
         if (tap_n_seq_max == 1 || !ubatch.seq_id) {
             // Fast path: single-seq or no seq routing info — write everything to seq 0.
@@ -895,22 +868,17 @@ void llama_context::write_tap_layers_post_compute(ggml_cgraph * gf, const llama_
             tap_files[idx][0].flush();
         } else {
             // Multi-seq path: route each token row to its seq's file.
-            // Tensor layout: row i corresponds to token i, stride = n_embd f16 values.
             const size_t row_f16_bytes = (size_t)tap_n_embd * sizeof(ggml_fp16_t);
-            GGML_ASSERT(n_tokens * tap_n_embd == n_elem);
+            GGML_ASSERT(n_tokens * (size_t)tap_n_embd == n_elem);
 
             for (uint32_t tok = 0; tok < n_tokens; ++tok) {
-                // seq_id[tok] is a pointer to an array of n_seq_id[tok] seq ids.
-                // We use the first (primary) seq_id for routing.
                 const llama_seq_id sid = ubatch.seq_id[tok][0];
-                // Clamp to valid range; skip tokens belonging to sequences outside our window.
                 if (sid < 0 || sid >= tap_n_seq_max) {
                     continue;
                 }
                 const ggml_fp16_t * row_ptr = f16_buf.data() + (size_t)tok * tap_n_embd;
                 tap_files[idx][sid].write(reinterpret_cast<const char *>(row_ptr), row_f16_bytes);
             }
-            // Flush all open files for this layer once after processing the whole ubatch.
             for (int s = 0; s < tap_n_seq_max; ++s) {
                 tap_files[idx][s].flush();
             }
@@ -1485,7 +1453,58 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // If tap is active, install an eval callback that captures tap-layer tensors
+    // eagerly — before ggml's memory allocator can reuse their backing buffer.
+    // The callback chains the existing user eval callback (if any).
+    const bool use_tap_eval = tap_out_dir && !tap_layers.empty();
+    if (use_tap_eval) {
+        // Reset staging buffers for this ubatch.
+        for (auto & stg : tap_staged) {
+            stg.data.clear();
+            stg.n_tokens = 0;
+        }
+        tap_eval_ud = {this, cparams.cb_eval, cparams.cb_eval_user_data};
+
+        static const ggml_backend_sched_eval_callback s_tap_eval_cb =
+            [](struct ggml_tensor * t, bool ask, void * ud) -> bool {
+                auto * ted = static_cast<tap_eval_ud_t *>(ud);
+                if (ted->user_cb && !ted->user_cb(t, ask, ted->user_ud)) {
+                    return false;
+                }
+                if (!t || !t->name[0]) return true;
+                llama_context * lctx = ted->lctx;
+                for (size_t idx = 0; idx < lctx->tap_layers.size(); ++idx) {
+                    char tname[64];
+                    std::snprintf(tname, sizeof(tname), "l_out-%d", lctx->tap_layers[idx]);
+                    if (std::strcmp(t->name, tname) != 0) continue;
+                    if (ask) return true;
+                    // ask == false: tensor just computed — capture before memory reuse.
+                    const size_t   n_elem = (size_t)ggml_nelements(t);
+                    const uint32_t n_tok  = (uint32_t)t->ne[1]; // shape: [n_embd, n_tokens]
+                    ggml_backend_t bk = ggml_backend_sched_get_tensor_backend(lctx->sched.get(), t);
+                    if (!bk) break;
+                    std::vector<float> f32(n_elem);
+                    ggml_backend_tensor_get(t, f32.data(), 0, n_elem * sizeof(float));
+                    auto & stg = lctx->tap_staged[idx];
+                    stg.data.resize(n_elem);
+                    stg.n_tokens = n_tok;
+                    for (size_t e = 0; e < n_elem; ++e) {
+                        stg.data[e] = ggml_fp32_to_fp16(f32[e]);
+                    }
+                    break;
+                }
+                return true;
+            };
+        ggml_backend_sched_set_eval_callback(sched.get(), s_tap_eval_cb, &tap_eval_ud);
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    // Restore user eval callback after tap-wrapped compute.
+    if (use_tap_eval) {
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2494,10 +2513,20 @@ int32_t llama_context::decode_mtp(
         return -4;
     }
 
+    // Eagle3 detection: pre_projection has 3*n_bb input cols (h_low||h_mid||h_high)
+    // vs Eagle2's 2*n_bb (tok_embd_padded||h_prev). h-states sourced from tap_staged.
+    const uint32_t pre_proj_cols = (uint32_t) model.mtp_assistant->mtp_pre_projection->ne[0];
+    const bool is_eagle3 = (pre_proj_cols == 3 * n_bb);
+    if (is_eagle3 && tap_staged.size() < 3) {
+        LLAMA_LOG_ERROR("%s: Eagle3 requires 3 tap layers; tap_staged.size=%zu\n",
+                        __func__, tap_staged.size());
+        return -5;
+    }
+
     // Build a 1-token ubatch shared by all steps
     auto data = std::make_shared<llama_ubatch::data_t>();
     data->token.resize(1);
-    data->embd.resize(n_bb);
+    data->embd.resize(pre_proj_cols);
     data->pos.resize(1);
     data->n_seq_id.resize(1);
     data->seq_id.resize(1);
@@ -2530,8 +2559,26 @@ int32_t llama_context::decode_mtp(
     data->output[0]      = 1; // need logits output
 
     llama_token cur_tok = last_token;
-    std::vector<float> hbuf(n_bb);
-    std::memcpy(hbuf.data(), h_prev, n_bb * sizeof(float));
+    std::vector<float> hbuf(pre_proj_cols);
+    if (is_eagle3) {
+        // Pack h_low||h_mid||h_high from tap_staged (f16 → f32) at last token pos.
+        // h-states are constant across all draft steps (fixed tap from target pass).
+        for (int ti = 0; ti < 3; ++ti) {
+            const auto & stg = tap_staged[ti];
+            if (stg.data.empty() || stg.n_tokens == 0) {
+                LLAMA_LOG_ERROR("%s: Eagle3 tap_staged[%d] empty\n", __func__, ti);
+                return -6;
+            }
+            const uint32_t last_pos = stg.n_tokens - 1;
+            const ggml_fp16_t * src = stg.data.data() + (size_t) last_pos * n_bb;
+            float * dst = hbuf.data() + (size_t) ti * n_bb;
+            for (uint32_t j = 0; j < n_bb; ++j) {
+                dst[j] = ggml_fp16_to_fp32(src[j]);
+            }
+        }
+    } else {
+        std::memcpy(hbuf.data(), h_prev, n_bb * sizeof(float));
+    }
 
     const int64_t save_n_outputs = n_outputs;
     n_outputs = 1;
@@ -2565,7 +2612,7 @@ int32_t llama_context::decode_mtp(
     for (int step = 0; step < n_steps; ++step) {
         data->token[0] = cur_tok;
         data->pos[0]   = attn_pos + 1 + (llama_pos) step;
-        std::memcpy(data->embd.data(), hbuf.data(), n_bb * sizeof(float));
+        std::memcpy(data->embd.data(), hbuf.data(), pre_proj_cols * sizeof(float));
 
         // Create a read-only memory context for the KV.
         // init_full() provides mask/index buffers without advancing the write cursor.
@@ -2582,7 +2629,12 @@ int32_t llama_context::decode_mtp(
         // second invocation when KV state has been mutated by main decodes in
         // between (#111). The graph uses build_attn_mtp which fetches K/V by
         // layer index directly from the cache — no mctx-applied masks needed.
-        auto * res = process_ubatch(ub, LLM_GRAPH_TYPE_MTP, mctx_up.get(), st, false);
+        // apply_mctx: gemma4 path uses kv_cache_iswa whose init_full() context
+        // has null lctx and crashes inside mctx->apply() (see #111 commit
+        // 431262920). For plain qwen3moe target, mctx->apply() is needed to
+        // allocate k_idxs/v_idxs buffers used by build_attn_inp_kv's set_input.
+        const bool apply_mctx_mtp = (model.arch == LLM_ARCH_QWEN3MOE);
+        auto * res = process_ubatch(ub, LLM_GRAPH_TYPE_MTP, mctx_up.get(), st, apply_mctx_mtp);
         if (!res || st != GGML_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: process_ubatch failed at step %d (st=%d)\n", __func__, step, (int) st);
             rc = -11;
@@ -2620,10 +2672,19 @@ int32_t llama_context::decode_mtp(
         }
         cur_tok = best;
 
-        // Extract post-projection hidden for next step
+        // Extract post-projection hidden for next step.
+        // Eagle2: replace entire hbuf with post_proj output (single n_bb tensor).
+        // Eagle3: h_low and h_mid stay fixed (from target tap); only the
+        // h_high portion (last n_bb of hbuf) gets recurrent update from post_proj.
         if (res->t_embd) {
             GGML_ASSERT((size_t) res->t_embd->ne[0] == (size_t) n_bb);
-            ggml_backend_tensor_get(res->t_embd, hbuf.data(), 0, n_bb * sizeof(float));
+            if (is_eagle3) {
+                // hbuf layout: [h_low | h_mid | h_high], each n_bb floats
+                float * h_high_dst = hbuf.data() + 2 * (size_t) n_bb;
+                ggml_backend_tensor_get(res->t_embd, h_high_dst, 0, n_bb * sizeof(float));
+            } else {
+                ggml_backend_tensor_get(res->t_embd, hbuf.data(), 0, n_bb * sizeof(float));
+            }
         }
     }
 

@@ -2408,8 +2408,12 @@ bool llama_kv_cache_context::apply() {
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
-        kv->update(lctx, do_shift, sc_info);
-
+        // init_full() uses the (kv) ctor which leaves lctx=null; that path is
+        // only for graph reservation/MTP read-only and must not trigger a
+        // shift/copy. Calling kv->update(null, ...) null-derefs in get_sched().
+        if (lctx) {
+            kv->update(lctx, do_shift, sc_info);
+        }
         return true;
     }
 

@@ -30,6 +30,11 @@ void llama_model_qwen3moe_assistant::load_arch_hparams(llama_model_loader & ml) 
     // Qwen3MoE assistant-specific: n_embd_backbone (target's n_embd).
     ml.get_key(LLM_KV_QWEN3MOE_ASSISTANT_N_EMBD_BACKBONE, hparams.n_embd_backbone, false);
 
+    // MoE drafter hparams — absent in old dense GGUFs (default to 0 = dense mode).
+    ml.get_key(LLM_KV_EXPERT_COUNT,               hparams.n_expert,      false);
+    ml.get_key(LLM_KV_EXPERT_USED_COUNT,          hparams.n_expert_used, false);
+    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp,      false);
+
     type = LLM_TYPE_UNKNOWN;
 }
 
@@ -48,8 +53,11 @@ void llama_model_qwen3moe_assistant::load_arch_tensors(llama_model_loader &) {
     // Token embedding: tied lm_head, inner hidden size = hparams.n_embd (e.g. 1024)
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
-    // MTP projection matrices
-    mtp_pre_projection  = create_tensor(tn(LLM_TENSOR_MTP_PRE_PROJECTION,  "weight"), {2 * (int64_t) n_bb, n_embd}, 0);
+    // MTP projection matrices — Eagle3 uses 3*n_bb cols, Eagle2 uses 2*n_bb
+    mtp_pre_projection = create_tensor(tn(LLM_TENSOR_MTP_PRE_PROJECTION, "weight"), {3 * (int64_t) n_bb, n_embd}, TENSOR_NOT_REQUIRED);
+    if (!mtp_pre_projection) {
+        mtp_pre_projection = create_tensor(tn(LLM_TENSOR_MTP_PRE_PROJECTION, "weight"), {2 * (int64_t) n_bb, n_embd}, 0);
+    }
     mtp_post_projection = create_tensor(tn(LLM_TENSOR_MTP_POST_PROJECTION, "weight"), {n_embd, (int64_t) n_bb}, 0);
 
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
@@ -77,12 +85,27 @@ void llama_model_qwen3moe_assistant::load_arch_tensors(llama_model_loader &) {
         const int64_t n_ff_cur = hparams.n_ff(i);
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd},   0);
 
-        // No precomputed rope_freqs tensor — Qwen3 NEOX RoPE builds freqs
-        // on-the-fly from rope.freq_base inside the graph (ggml_rope_ext).
+        if (hparams.n_expert > 0) {
+            // MoE drafter path
+            const int64_t n_exp     = (int64_t) hparams.n_expert;
+            const int64_t n_ff_exp  = (int64_t) hparams.n_ff_exp;
+            layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_exp},              TENSOR_NOT_REQUIRED);
+            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_exp},    TENSOR_NOT_REQUIRED);
+            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_exp},    TENSOR_NOT_REQUIRED);
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_exp},    TENSOR_NOT_REQUIRED);
+        } else {
+            // Dense drafter path (original)
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd},   0);
+        }
+
+        // RoPE freqs optional (TENSOR_NOT_REQUIRED). Qwen3 NEOX RoPE builds
+        // them on-the-fly from rope.freq_base when nullptr.
+        layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i),
+                                         {n_embd_head_i / 2},
+                                         llama_model_loader::TENSOR_NOT_REQUIRED);
     }
 }
 
@@ -120,11 +143,15 @@ llm_build_qwen3moe_mtp::llm_build_qwen3moe_mtp(
     GGML_ASSERT(n_bb > 0);
     GGML_ASSERT(mtp.mtp_pre_projection != nullptr && mtp.mtp_post_projection != nullptr);
 
+    // Eagle3 detection: pre_projection input cols = 3*n_bb (h_low||h_mid||h_high)
+    const int64_t pre_proj_cols = mtp.mtp_pre_projection->ne[0];
+    const bool is_eagle3 = (pre_proj_cols == 3 * n_bb);
+
     ggml_tensor * inp_tok = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
     ggml_set_input(inp_tok);
     cb(inp_tok, "mtp_inp_last_token", -1);
 
-    ggml_tensor * inp_h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_bb, 1);
+    ggml_tensor * inp_h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, pre_proj_cols, 1);
     ggml_set_input(inp_h);
     cb(inp_h, "mtp_inp_h_prev", -1);
 
@@ -135,24 +162,47 @@ llm_build_qwen3moe_mtp::llm_build_qwen3moe_mtp(
         res->add_input(std::move(inp_wrap));
     }
 
-    ggml_tensor * tok_e = ggml_get_rows(ctx0, target.tok_embd, inp_tok);
-    cb(tok_e, "mtp_tgt_tok_embd", -1);
+    ggml_tensor * tok_e = ggml_get_rows(ctx0, mtp.tok_embd, inp_tok);
+    cb(tok_e, "mtp_self_tok_embd", -1);
 
-    // Qwen3MoE scales token embeddings by sqrt(hidden_size).
-    tok_e = ggml_scale(ctx0, tok_e, sqrtf((float) n_bb));
-    cb(tok_e, "mtp_tgt_tok_embd_scaled", -1);
-
-    ggml_tensor * inp_cat = ggml_concat(ctx0, tok_e, inp_h, 0);
-    cb(inp_cat, "mtp_concat", -1);
-
-    ggml_tensor * inpL = build_lora_mm(mtp.mtp_pre_projection, inp_cat);
-    cb(inpL, "mtp_pre_proj_out", -1);
+    ggml_tensor * inpL;
+    if (is_eagle3) {
+        // Eagle3: fused = h_proj(cat(h_low, h_mid, h_high)) + tok_embd(token)
+        // inp_h is (3*n_bb, 1), pre_projection is (3*n_bb → n_embd_inner)
+        ggml_tensor * h_fused = build_lora_mm(mtp.mtp_pre_projection, inp_h);
+        cb(h_fused, "mtp_h_fused", -1);
+        inpL = ggml_add(ctx0, h_fused, tok_e);
+        cb(inpL, "mtp_pre_proj_out", -1);
+    } else {
+        // Eagle2: inpL = pre_proj(concat(tok_embd_padded, h_prev))
+        const int64_t n_inner = (int64_t) hparams.n_embd;
+        if (n_inner < (int64_t) n_bb) {
+            ggml_tensor * pad = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) n_bb - n_inner, 1);
+            pad = ggml_scale(ctx0, pad, 0.0f);
+            tok_e = ggml_concat(ctx0, tok_e, pad, 0);
+            cb(tok_e, "mtp_tok_embd_padded", -1);
+        }
+        ggml_tensor * inp_cat = ggml_concat(ctx0, tok_e, inp_h, 0);
+        cb(inp_cat, "mtp_concat", -1);
+        inpL = build_lora_mm(mtp.mtp_pre_projection, inp_cat);
+        cb(inpL, "mtp_pre_proj_out", -1);
+    }
 
     ggml_build_forward_expand(gf, inpL);
 
     ggml_tensor * inp_pos = build_inp_pos();
 
     auto * inp_attn = build_attn_inp_kv();
+    // build_attn_inp_kv creates self_k_idxs / self_v_idxs / self_kq_mask
+    // tensors that are populated in set_input but only referenced inside
+    // build_attn (not build_attn_mtp_plain). Without an explicit graph-output
+    // reference, sched_alloc_graph skips them and their buffers stay null,
+    // causing set_input to abort at ggml-backend.cpp:194. Force them into
+    // the forward graph so they get allocated.
+    if (inp_attn->self_k_idxs)     ggml_build_forward_expand(gf, inp_attn->self_k_idxs);
+    if (inp_attn->self_v_idxs)     ggml_build_forward_expand(gf, inp_attn->self_v_idxs);
+    if (inp_attn->self_kq_mask)    ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
+    if (inp_attn->self_kq_mask_cnv) ggml_build_forward_expand(gf, inp_attn->self_kq_mask_cnv);
 
     ggml_tensor * cur = nullptr;
 
@@ -169,8 +219,7 @@ llm_build_qwen3moe_mtp::llm_build_qwen3moe_mtp(
         cur = build_norm(inpL, mtp.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        // No precomputed rope_freqs — let ggml_rope_ext compute from freq_base.
-        ggml_tensor * freq_factors = nullptr;
+        ggml_tensor * freq_factors = mtp.layers[il].rope_freqs;  // nullptr if absent
 
         ggml_tensor * Qcur = build_lora_mm(mtp.layers[il].wq, cur);
         cb(Qcur, "Qcur", il);
@@ -194,24 +243,42 @@ llm_build_qwen3moe_mtp::llm_build_qwen3moe_mtp(
         cur = build_attn_mtp_plain(inp_attn, mtp.layers[il].wo, nullptr, Qcur, nullptr, nullptr, nullptr,
                 kq_scale, il, il_kv, kv_embd_head_v, kv_n_head_v, false);
 
-        cur = build_norm(cur, mtp.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
-        cb(cur, "attn_post_norm", il);
-
+        // No post-attention RMSNorm: trainer's EagleBlock (eagle_head.py) does
+        // direct residual add. Previous version applied attn_q_norm (dim 128)
+        // to cur (dim n_embd_inner) which is a shape mismatch and silently
+        // distorts the activation.
         ggml_tensor * attn_out = ggml_add(ctx0, cur, inpL);
         cb(attn_out, "attn_out", il);
-
-        GGML_ASSERT(mtp.layers[il].ffn_gate_inp == nullptr && "qwen3moe_assistant MTP does not support MoE FFN");
 
         cur = build_norm(attn_out, mtp.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        cur = build_ffn(cur,
-                mtp.layers[il].ffn_up,   nullptr, nullptr,
-                mtp.layers[il].ffn_gate, nullptr, nullptr,
-                mtp.layers[il].ffn_down, nullptr, nullptr,
-                nullptr,
-                LLM_FFN_GELU, LLM_FFN_PAR, il);
-        cb(cur, "ffn_out", il);
+        if (mtp.layers[il].ffn_gate_inp != nullptr) {
+            const int64_t n_exp      = (int64_t) mtp.hparams.n_expert;
+            const int64_t n_exp_used = (int64_t) mtp.hparams.n_expert_used;
+            cur = build_moe_ffn(cur,
+                    mtp.layers[il].ffn_gate_inp,
+                    mtp.layers[il].ffn_up_exps,
+                    mtp.layers[il].ffn_gate_exps,
+                    mtp.layers[il].ffn_down_exps,
+                    nullptr,
+                    n_exp, n_exp_used,
+                    LLM_FFN_SILU, true,
+                    0.0f,
+                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                    il,
+                    nullptr, nullptr,
+                    nullptr, nullptr, nullptr);
+            cb(cur, "ffn_moe_out", il);
+        } else {
+            cur = build_ffn(cur,
+                    mtp.layers[il].ffn_up,   nullptr, nullptr,
+                    mtp.layers[il].ffn_gate, nullptr, nullptr,
+                    mtp.layers[il].ffn_down, nullptr, nullptr,
+                    nullptr,
+                    LLM_FFN_GELU, LLM_FFN_PAR, il);
+            cb(cur, "ffn_out", il);
+        }
 
         cur = ggml_add(ctx0, cur, attn_out);
 

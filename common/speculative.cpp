@@ -42,6 +42,7 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"mtp",                COMMON_SPECULATIVE_TYPE_MTP},
     {"gemma4_assistant",   COMMON_SPECULATIVE_TYPE_GEMMA4_ASSISTANT},
     {"qwen3_assistant",    COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT},
+    {"qwen3moe_assistant", COMMON_SPECULATIVE_TYPE_QWEN3_ASSISTANT},
     {"ngram_simple",       COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram_map_k",        COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram_map_k4v",      COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -773,7 +774,9 @@ struct common_speculative_state_mtp : public common_speculative_state {
             last_n_accepted = 0;
         }
 
-        const int32_t n_max     = std::max(1, params.draft.n_max);
+        const int32_t n_max     = params.draft_block_size > 1
+                                    ? params.draft_block_size - 1
+                                    : std::max(1, params.draft.n_max);
         const size_t  row_bytes = (size_t) n_embd * sizeof(float);
 
         llama_token cond_tok = id_last;
@@ -1106,6 +1109,11 @@ struct common_speculative_state_mtp : public common_speculative_state {
     }
 
     int32_t n_max(const common_params_speculative & params) const override {
+        // Prefer --draft-block-size N (→ N-1 drafts per step) over --draft-max.
+        // Without this, --draft-block-size 3 still caps at 1 draft token.
+        if (params.draft_block_size > 1) {
+            return params.draft_block_size - 1;
+        }
         return std::max(1, params.draft.n_max);
     }
 
