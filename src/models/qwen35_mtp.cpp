@@ -202,4 +202,9 @@ llama_model_qwen35_mtp::graph::graph(const llama_model & model, const llm_graph_
 
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
+
+    ggml_tensor * sampled = ggml_argmax(ctx0, cur);
+    cb(sampled, "mtp_sampled_token", -1);
+    ggml_build_forward_expand(gf, sampled);
+    res->t_sampled_token = sampled;
 }

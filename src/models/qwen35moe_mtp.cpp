@@ -247,4 +247,12 @@ llama_model_qwen35moe_mtp::graph::graph(const llama_model & model, const llm_gra
 
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
+
+    // NextN-MTP greedy chain: device-side argmax of the logits so the sampled
+    // token id is produced on GPU. p_min still needs CPU logits; this is for
+    // future fused-chain paths that bypass common_sampler.
+    ggml_tensor * sampled = ggml_argmax(ctx0, cur);
+    cb(sampled, "mtp_sampled_token", -1);
+    ggml_build_forward_expand(gf, sampled);
+    res->t_sampled_token = sampled;
 }
