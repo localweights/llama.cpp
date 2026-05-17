@@ -1206,7 +1206,16 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
 
         n_embd = llama_model_n_embd(llama_get_model(ctx_dft));
 
-        const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+        // Batch capacity must cover the largest incoming process() batch.
+        // process() can be called with the FULL prefill batch (not split by
+        // ubatch), so size at n_ctx (worst case = full context) rather than
+        // n_batch (ubatch-cap). Without this, prefill of >n_batch tokens
+        // overflows batch.seq_id and trips
+        // "GGML_ASSERT(batch.seq_id[batch.n_tokens]) llama_batch size exceeded"
+        // in common_batch_add.
+        const int32_t n_b = std::max<int32_t>(
+                (int32_t) llama_n_batch(ctx_dft),
+                (int32_t) llama_n_ctx(ctx_dft));
         batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);

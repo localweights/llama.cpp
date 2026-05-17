@@ -1206,12 +1206,19 @@ private:
             auto cparams_mtp = common_context_params_to_llama(params_base);
             cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             cparams_mtp.n_rs_seq = 0;
-            // MTP drafter only ever decodes 1-token batches in chain mode +
-            // up to the prefill ubatch size in process(). Smaller batch/ubatch
-            // reduces per-decode dispatch overhead (CUDA kernel arg setup,
-            // graph node allocs). Cap at trunk's ubatch_size to keep prefill OK.
-            cparams_mtp.n_batch  = std::min<uint32_t>(cparams_mtp.n_batch,  (uint32_t) params_base.n_ubatch);
-            cparams_mtp.n_ubatch = std::min<uint32_t>(cparams_mtp.n_ubatch, (uint32_t) params_base.n_ubatch);
+            // MTP drafter handles two batch shapes:
+            //   1) Chain mode: 1-token batches per draft step.
+            //   2) Prefill mode: process() is called with the trunk's FULL
+            //      prefill batch (not split by ubatch). The drafter must
+            //      accept the same batch shape as the trunk so it can mirror
+            //      KV positions and tap pre-norm h-states.
+            // Previously we capped n_batch at the trunk's ubatch_size which
+            // overflowed llama_batch.seq_id when the trunk dispatched a
+            // multi-ubatch prefill batch through process(). Keep n_batch at
+            // trunk's full n_batch; keep n_ubatch matched to trunk's so per-
+            // decode dispatch granularity stays small.
+            cparams_mtp.n_batch  = params_base.n_batch;
+            cparams_mtp.n_ubatch = params_base.n_ubatch;
             // Single-seq slot — no need for extra seq slots in MTP ctx.
             cparams_mtp.n_seq_max = 1;
             // Disable performance stats on the drafter to avoid the ggml-time-us calls
